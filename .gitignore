@@ -1,0 +1,74 @@
+# OSX
+#
+.DS_Store
+
+# Node
+#
+node_modules/
+npm-debug.log
+yarn-error.log
+
+# React Native
+#
+.metro-health-check-id
+
+# Android/IntelliJ
+#
+android/build/
+android/app/build/
+android/app/build_interstitials/
+android/local.properties
+android/.idea
+android/.gradle
+android/.cxx/
+android/*.iml
+android/local.properties
+
+# iOS
+#
+ios/Pods/
+ios/build/
+ios/Index/
+ios/*.xcworkspace/xcuserdata
+ios/*.xcodeproj/xcuserdata
+ios/*.xcodeproj/project.xcworkspace/xcuserdata
+ios/*.xcodeproj/project.xcworkspace/xcshareddata/SwiftPackageManager/
+ios/Podfile.lock
+
+# Xcode
+#
+build/
+*.pbxuser
+!default.pbxuser
+*.mode1v3
+!default.mode1v3
+*.mode2v3
+!default.mode2v3
+*.perspectivev3
+!default.perspectivev3
+xcuserdata
+*.xccheckout
+*.moved-aside
+DerivedData
+*.hmap
+*.ipa
+*.xcuserstate
+
+# Android Studio
+#
+captures/
+.externalNativeBuild
+.cxx
+
+# IDEs
+#
+.idea/
+.vscode/
+*.swp
+*.swo
+
+# Temporary files
+#
+*.log
+*.tmp
+.DS_Store

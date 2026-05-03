@@ -1,0 +1,19 @@
+Create folder:
+mkdir -p .github/workflows
+
+Create file:
+nano .github/workflows/deploy.yml
+
+Add:
+name: Secure Deployment Pipeline
+on:
+push:
+branches: [ main ]
+jobs:
+deploy:
+runs-on: ubuntu-latest
+steps:
+- name: Checkout code
+uses: actions/checkout@v4
+- name: Use Secret
+run: echo &quot;API KEY is ${{ secrets.API_KEY }}&quot;
