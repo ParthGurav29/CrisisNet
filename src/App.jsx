@@ -1,13 +1,14 @@
-import React from 'react';
+import React, {useEffect} from 'react';
 import {NavigationContainer} from '@react-navigation/native';
 import {createBottomTabNavigator} from '@react-navigation/bottom-tabs';
-import {Text, StatusBar} from 'react-native';
+import {Text, StatusBar, PermissionsAndroid, Platform} from 'react-native';
 
 import HomeScreen from './screens/Home';
 import ChatScreen from './screens/Chat';
 import AskAIScreen from './screens/AskAI';
 import TriageScreen from './screens/Triage';
 import EmergencyScreen from './screens/Emergency';
+import meshService from './mesh/meshService';
 
 const Tab = createBottomTabNavigator();
 
@@ -20,6 +21,48 @@ const TAB_ICONS = {
 };
 
 export default function App() {
+  const requestPermissions = async () => {
+    if (Platform.OS === 'android') {
+      try {
+        const granted = await PermissionsAndroid.requestMultiple([
+          PermissionsAndroid.PERMISSIONS.BLUETOOTH_SCAN,
+          PermissionsAndroid.PERMISSIONS.BLUETOOTH_CONNECT,
+          PermissionsAndroid.PERMISSIONS.ACCESS_FINE_LOCATION,
+        ]);
+
+        const allGranted = Object.values(granted).every(
+          status => status === PermissionsAndroid.RESULTS.GRANTED
+        );
+
+        return allGranted;
+      } catch (err) {
+        console.warn(err);
+        return false;
+      }
+    }
+    return true;
+  };
+
+  useEffect(() => {
+    const initApp = async () => {
+      const hasPermission = await requestPermissions();
+
+      if (hasPermission) {
+        console.log('Permissions granted, starting mesh...');
+        
+        // Delay slightly to avoid native crash timing issues
+        setTimeout(() => {
+          meshService.init();
+        }, 1000);
+
+      } else {
+        console.log('Permissions denied');
+      }
+    };
+
+    initApp();
+  }, []);
+
   return (
     <NavigationContainer>
       <StatusBar barStyle="light-content" backgroundColor="#0a0f1e" />
