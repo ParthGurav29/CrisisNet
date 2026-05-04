@@ -1,43 +1,94 @@
-import React from 'react';
-import {View, Text, StyleSheet, ScrollView} from 'react-native';
+import React, {useState, useEffect, useRef} from 'react';
+import {View, Text, StyleSheet, ScrollView, TextInput, TouchableOpacity, ActivityIndicator, KeyboardAvoidingView, Platform} from 'react-native';
+import {initModel, ask} from '../ai/llamaService';
 
 export default function AskAIScreen() {
+  const [ready, setReady] = useState(false);
+  const [loading, setLoading] = useState(false);
+  const [input, setInput] = useState('');
+  const [messages, setMessages] = useState([]);
+  const scrollRef = useRef(null);
+
+  useEffect(() => {
+    (async () => {
+      const success = await initModel();
+      if (success) setReady(true);
+    })();
+  }, []);
+
+  const handleAsk = async () => {
+    if (!input.trim() || loading) return;
+    const question = input.trim();
+    setInput('');
+    setMessages(prev => [...prev, {role: 'user', text: question}]);
+    setLoading(true);
+    try {
+      const response = await ask(question);
+      setMessages(prev => [...prev, {role: 'ai', text: response}]);
+    } catch (e) {
+      setMessages(prev => [...prev, {role: 'ai', text: 'Error: ' + e.message}]);
+    } finally {
+      setLoading(false);
+    }
+    setTimeout(() => scrollRef.current?.scrollToEnd({animated: true}), 100);
+  };
+
   return (
-    <View style={styles.container}>
+    <KeyboardAvoidingView
+      style={styles.container}
+      behavior={Platform.OS === 'ios' ? 'padding' : undefined}
+      keyboardVerticalOffset={80}>
       <View style={styles.header}>
         <Text style={styles.title}>🤖 Ask AI</Text>
-        <Text style={styles.subtitle}>Powered by Gemma 4 · Runs fully offline</Text>
+        <Text style={styles.subtitle}>
+          {ready ? 'Powered by Gemma · Runs fully offline' : 'Loading model...'}
+        </Text>
       </View>
 
-      <ScrollView contentContainerStyle={styles.body}>
-        <View style={styles.aiCard}>
-          <Text style={styles.aiCardText}>
-            "What are the symptoms of severe dehydration?"
-          </Text>
-          <Text style={styles.aiLabel}>Sample question</Text>
-        </View>
-
-        <View style={styles.responseCard}>
-          <Text style={styles.responseHeader}>🧠 Gemma responds:</Text>
-          <Text style={styles.responseText}>
-            SEVERE DEHYDRATION — Signs:{'\n'}
-            1. Extreme thirst, dry mouth{'\n'}
-            2. No urination for 8+ hours{'\n'}
-            3. Sunken eyes, rapid heartbeat{'\n'}
-            4. Confusion or dizziness{'\n\n'}
-            Act immediately — seek water and shade.
-          </Text>
-        </View>
-
-        <View style={styles.placeholder}>
-          <Text style={styles.placeholderIcon}>⌨️</Text>
-          <Text style={styles.placeholderText}>AI input coming soon</Text>
-          <Text style={styles.placeholderSub}>
-            Ask any survival or medical question — no internet required
-          </Text>
-        </View>
+      <ScrollView
+        ref={scrollRef}
+        contentContainerStyle={styles.body}
+        keyboardShouldPersistTaps="handled">
+        {messages.length === 0 && !ready && (
+          <View style={styles.placeholder}>
+            <ActivityIndicator size="large" color="#4d9fff" />
+            <Text style={styles.placeholderText}>Initializing Gemma model...</Text>
+          </View>
+        )}
+        {messages.map((msg, idx) => (
+          <View
+            key={idx}
+            style={[styles.bubble, msg.role === 'user' ? styles.bubbleUser : styles.bubbleAI]}>
+            <Text style={styles.bubbleRole}>
+              {msg.role === 'user' ? 'You' : '🧠 Gemma'}
+            </Text>
+            <Text style={styles.bubbleText}>{msg.text}</Text>
+          </View>
+        ))}
+        {loading && (
+          <View style={[styles.bubble, styles.bubbleAI]}>
+            <Text style={styles.bubbleRole}>🧠 Gemma</Text>
+            <ActivityIndicator size="small" color="#4dff88" />
+          </View>
+        )}
       </ScrollView>
-    </View>
+
+      <View style={styles.inputBar}>
+        <TextInput
+          style={styles.input}
+          placeholder="Ask a survival or medical question..."
+          placeholderTextColor="#4a5880"
+          value={input}
+          onChangeText={setInput}
+          onSubmitEditing={handleAsk}
+          returnKeyType="send"
+          editable={ready}
+        />
+        <TouchableOpacity style={styles.sendBtn} onPress={handleAsk} disabled={!ready || !input.trim()}>
+          <Text style={styles.sendBtnText}>Send</Text>
+        </TouchableOpacity>
+      </View>
+    </KeyboardAvoidingView>
   );
 }
 
@@ -65,44 +116,8 @@ const styles = StyleSheet.create({
   },
   body: {
     padding: 20,
-    gap: 16,
-  },
-  aiCard: {
-    backgroundColor: '#1a3a6e',
-    borderRadius: 16,
-    padding: 16,
-    borderWidth: 1,
-    borderColor: '#2a4d8a',
-  },
-  aiCardText: {
-    color: '#c0d8ff',
-    fontSize: 15,
-    fontStyle: 'italic',
-    marginBottom: 6,
-  },
-  aiLabel: {
-    color: '#4d9fff',
-    fontSize: 11,
-    fontWeight: '600',
-    textTransform: 'uppercase',
-  },
-  responseCard: {
-    backgroundColor: '#0d1f0d',
-    borderRadius: 16,
-    padding: 16,
-    borderWidth: 1,
-    borderColor: '#1a4a1a',
-  },
-  responseHeader: {
-    color: '#4dff88',
-    fontSize: 13,
-    fontWeight: '700',
-    marginBottom: 10,
-  },
-  responseText: {
-    color: '#c8f0d8',
-    fontSize: 14,
-    lineHeight: 22,
+    paddingBottom: 100,
+    gap: 12,
   },
   placeholder: {
     backgroundColor: '#121929',
@@ -112,21 +127,75 @@ const styles = StyleSheet.create({
     borderWidth: 1,
     borderColor: '#1e2d4a',
     borderStyle: 'dashed',
-    marginTop: 8,
-  },
-  placeholderIcon: {
-    fontSize: 36,
-    marginBottom: 12,
+    marginTop: 20,
   },
   placeholderText: {
     color: '#8899bb',
     fontSize: 16,
     fontWeight: '600',
-    marginBottom: 6,
+    marginTop: 12,
   },
-  placeholderSub: {
-    color: '#4a5880',
-    fontSize: 13,
-    textAlign: 'center',
+  bubble: {
+    borderRadius: 16,
+    padding: 14,
+    maxWidth: '85%',
+  },
+  bubbleUser: {
+    backgroundColor: '#1a3a6e',
+    alignSelf: 'flex-end',
+    borderBottomRightRadius: 4,
+  },
+  bubbleAI: {
+    backgroundColor: '#0d1f0d',
+    alignSelf: 'flex-start',
+    borderWidth: 1,
+    borderColor: '#1a4a1a',
+    borderBottomLeftRadius: 4,
+  },
+  bubbleRole: {
+    fontSize: 11,
+    fontWeight: '700',
+    marginBottom: 6,
+    textTransform: 'uppercase',
+  },
+  bubbleText: {
+    color: '#e0e8ff',
+    fontSize: 14,
+    lineHeight: 22,
+  },
+  inputBar: {
+    position: 'absolute',
+    bottom: 0,
+    left: 0,
+    right: 0,
+    flexDirection: 'row',
+    backgroundColor: '#121929',
+    borderTopWidth: 1,
+    borderTopColor: '#1e2d4a',
+    paddingHorizontal: 16,
+    paddingVertical: 12,
+    paddingBottom: Platform.OS === 'ios' ? 34 : 12,
+    alignItems: 'center',
+    gap: 10,
+  },
+  input: {
+    flex: 1,
+    backgroundColor: '#1a2238',
+    borderRadius: 20,
+    paddingHorizontal: 16,
+    paddingVertical: 10,
+    color: '#ffffff',
+    fontSize: 14,
+  },
+  sendBtn: {
+    backgroundColor: '#4d9fff',
+    borderRadius: 20,
+    paddingHorizontal: 18,
+    paddingVertical: 10,
+  },
+  sendBtnText: {
+    color: '#ffffff',
+    fontWeight: '700',
+    fontSize: 14,
   },
 });

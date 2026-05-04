@@ -423,8 +423,8 @@ CrisisNet/
 ```
 Node.js v18 or higher
 React Native CLI
-Android Studio
-Java Development Kit JDK 17
+Android Studio (Required for ADB and SDK)
+Java Development Kit JDK 17 (CRITICAL: Newer JDKs like 26 will cause Gradle 8.13 build errors)
 An Android device for testing
 A second Android device for mesh testing
 Google Colab account for fine-tuning
@@ -493,12 +493,12 @@ The emergency AI is fine-tuned on verified protocols from WHO, Red Cross, FEMA, 
 ### Running Fine-Tuning
 
 ```bash
-# Open Google Colab with free T4 GPU
-# Upload fine-tuning/train.py and dataset/
-
-# Or run locally with GPU
+# Note: On macOS, you must use a virtual environment to install packages.
 cd fine-tuning
-pip install unsloth
+python3 -m venv venv
+source venv/bin/activate
+pip install -r requirements.txt
+
 python train.py
 ```
 
@@ -563,7 +563,10 @@ Emergency Mode:
 
 ### Phase 1 — MVP (Current)
 - [x] Project structure and README
-- [ ] React Native + Offline Protocol SDK setup
+- [x] React Native 0.85 setup & Gradle configurations
+- [x] Core UI Navigation (Home, Chat, Ask AI, Triage, Emergency)
+- [x] Android permissions flow for Mesh Networking (Bluetooth, Location)
+- [ ] Offline Protocol SDK complete integration
 - [ ] Mesh working between 2 phones
 - [ ] Gemma E2B loaded on device
 - [ ] Everyday offline chat working

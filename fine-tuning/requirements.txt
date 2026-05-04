@@ -1,0 +1,9 @@
+unsloth
+huggingface_hub
+torch
+transformers
+datasets
+accelerate
+trl
+peft
+bitsandbytes

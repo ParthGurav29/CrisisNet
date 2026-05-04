@@ -1,42 +1,51 @@
-# OSX
-#
+# OS Generated Files
 .DS_Store
+*.DS_Store
+.AppleDouble
+.LSOverride
 
 # Node
-#
 node_modules/
-npm-debug.log
-yarn-error.log
+npm-debug.log*
+yarn-debug.log*
+yarn-error.log*
+pnpm-debug.log*
+.pnpm/
+.pnpm.js/
 
 # React Native
-#
 .metro-health-check-id
+.expo/
 
-# Android/IntelliJ
-#
+# Android
 android/build/
 android/app/build/
-android/app/build_interstitials/
+android/app/build_intermediates/
+android/app/src/main/assets/
 android/local.properties
-android/.idea
-android/.gradle
+android/.idea/
+android/.gradle/
 android/.cxx/
 android/*.iml
-android/local.properties
+android/gradlew
+android/gradlew.bat
+android/gradle/
 
 # iOS
-#
 ios/Pods/
 ios/build/
 ios/Index/
-ios/*.xcworkspace/xcuserdata
-ios/*.xcodeproj/xcuserdata
-ios/*.xcodeproj/project.xcworkspace/xcuserdata
+ios/*.xcworkspace/xcuserdata/
+ios/*.xcodeproj/xcuserdata/
+ios/*.xcodeproj/project.xcworkspace/xcuserdata/
 ios/*.xcodeproj/project.xcworkspace/xcshareddata/SwiftPackageManager/
 ios/Podfile.lock
+ios/DerivedData/
+ios/*.ipa
+ios/*.xcuserstate
+ios/xcuserdata/
 
 # Xcode
-#
 build/
 *.pbxuser
 !default.pbxuser
@@ -46,29 +55,45 @@ build/
 !default.mode2v3
 *.perspectivev3
 !default.perspectivev3
-xcuserdata
-*.xccheckout
+xcuserdata/
 *.moved-aside
-DerivedData
+DerivedData/
 *.hmap
 *.ipa
 *.xcuserstate
 
-# Android Studio
-#
-captures/
-.externalNativeBuild
-.cxx
-
 # IDEs
-#
 .idea/
 .vscode/
 *.swp
 *.swo
+*~
 
-# Temporary files
-#
+# Temporary/Generated Files
 *.log
 *.tmp
-.DS_Store
+*.temp
+/tmp/
+
+# Capacitor
+capacitor.config.json
+android/capacitor.config.json
+
+# Model Files
+models/*.gguf
+*.gguf
+
+# Fine-tuning
+fine-tuning/checkpoints/
+fine-tuning/logs/
+fine-tuning/*.bin
+fine-tuning/*.safetensors
+
+# Expo
+.expo/
+.expo-shared/
+
+# Misc
+captures/
+.externalNativeBuild/
+.cxx/
