@@ -1,13 +1,42 @@
-import React from 'react';
-import {View, Text, StyleSheet, ScrollView} from 'react-native';
+import React, { useState } from 'react';
+import {View, Text, StyleSheet, ScrollView, TouchableOpacity, Alert} from 'react-native';
+import { useMesh } from '../hooks/useMesh';
 
-const EMERGENCY_FEED = [
-  {id: '1', type: 'SOS', sender: 'Device-A7F2', desc: 'Person unconscious, 3rd floor', time: '2m ago', color: '#ff2244'},
-  {id: '2', type: 'HAZARD', sender: 'Device-B3C1', desc: 'Gas smell near east stairwell', time: '5m ago', color: '#ffaa00'},
-  {id: '3', type: 'RESOURCE', sender: 'Device-D9E4', desc: 'First aid kit found at lobby', time: '8m ago', color: '#00cc66'},
-];
+const getTriageColor = (tag) => {
+  switch ((tag || '').toUpperCase()) {
+    case 'RED': return '#ff2244';
+    case 'YELLOW': return '#ffaa00';
+    case 'GREEN': return '#00cc66';
+    default: return '#ffaa00';
+  }
+};
 
 export default function EmergencyScreen() {
+  const { messages, sendEmergency } = useMesh();
+
+  const emergencyFeed = messages.filter(m => m.type === 'emergency');
+
+  const handleSOS = () => {
+    Alert.alert(
+      "Confirm SOS",
+      "This will broadcast an emergency signal to all nearby devices. Continue?",
+      [
+        { text: "Cancel", style: "cancel" },
+        { 
+          text: "BROADCAST", 
+          style: "destructive",
+          onPress: () => {
+            sendEmergency({
+              type: 'SOS',
+              desc: 'Emergency SOS Signal Sent',
+              color: 'RED'
+            });
+          }
+        }
+      ]
+    );
+  };
+
   return (
     <View style={styles.container}>
       <View style={styles.header}>
@@ -15,32 +44,37 @@ export default function EmergencyScreen() {
         <Text style={styles.subtitle}>Live mesh feed · No internet required</Text>
       </View>
 
-      <View style={styles.sosButton}>
+      <TouchableOpacity style={styles.sosButton} onPress={handleSOS}>
         <Text style={styles.sosIcon}>🆘</Text>
         <Text style={styles.sosText}>SOS BROADCAST</Text>
         <Text style={styles.sosSub}>Tap to broadcast across entire mesh</Text>
-      </View>
+      </TouchableOpacity>
 
       <Text style={styles.feedLabel}>Emergency Mesh Feed</Text>
 
       <ScrollView contentContainerStyle={styles.feed}>
-        {EMERGENCY_FEED.map(item => (
-          <View key={item.id} style={[styles.feedCard, {borderLeftColor: item.color}]}>
-            <View style={[styles.typeBadge, {backgroundColor: item.color + '33'}]}>
-              <Text style={[styles.typeText, {color: item.color}]}>{item.type}</Text>
-            </View>
-            <Text style={styles.feedDesc}>{item.desc}</Text>
-            <View style={styles.feedMeta}>
-              <Text style={styles.feedSender}>{item.sender}</Text>
-              <Text style={styles.feedTime}>{item.time}</Text>
-            </View>
+        {emergencyFeed.length > 0 ? (
+          emergencyFeed.map(item => {
+            const color = getTriageColor(item.triage);
+            return (
+              <View key={item.id} style={[styles.feedCard, {borderLeftColor: color}]}>
+                <View style={[styles.typeBadge, {backgroundColor: color + '33'}]}>
+                  <Text style={[styles.typeText, {color: color}]}>{item.sender === 'You' ? 'MY ALERT' : 'SOS'}</Text>
+                </View>
+                <Text style={styles.feedDesc}>{item.text}</Text>
+                <View style={styles.feedMeta}>
+                  <Text style={styles.feedSender}>{item.sender}</Text>
+                  <Text style={styles.feedTime}>{new Date(item.timestamp).toLocaleTimeString()}</Text>
+                </View>
+              </View>
+            )
+          })
+        ) : (
+          <View style={styles.placeholder}>
+            <Text style={styles.placeholderText}>No active emergencies</Text>
+            <Text style={styles.placeholderSub}>Powered by mesh broadcast · real-time</Text>
           </View>
-        ))}
-
-        <View style={styles.placeholder}>
-          <Text style={styles.placeholderText}>More events will appear here</Text>
-          <Text style={styles.placeholderSub}>Powered by mesh broadcast · real-time</Text>
-        </View>
+        )}
       </ScrollView>
     </View>
   );

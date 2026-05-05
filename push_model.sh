@@ -6,19 +6,21 @@
 
 set -e
 
-MODEL_FILE="models/gemma.gguf"
+MODEL_FILE="models/gemma-4-E2B-it-Q4_K_M.gguf"
 PACKAGE="com.crisisnet"
-DEST="/sdcard/Android/data/$PACKAGE/files/gemma.gguf"
+DEST="/sdcard/Android/data/$PACKAGE/files/models/gemma-4-E2B-it-Q4_K_M.gguf"
 
 if [ ! -f "$MODEL_FILE" ]; then
   echo "❌ Model not found at $MODEL_FILE"
-  echo "   Place your gemma.gguf file in the models/ directory first."
+  echo "   Place your gemma-4-E2B-it-Q4_K_M.gguf file in the models/ directory first."
   exit 1
 fi
 
 LOCAL_SIZE=$(wc -c < "$MODEL_FILE" | tr -d ' ')
 echo "📦 Pushing model ($((LOCAL_SIZE / 1048576)) MB) directly to app storage..."
 echo "   This takes ~20-30 seconds..."
+
+mkdir -p "$(dirname "$DEST")"
 adb push "$MODEL_FILE" "$DEST"
 
 DEVICE_SIZE=$(adb shell "wc -c < $DEST" | tr -d '\r')

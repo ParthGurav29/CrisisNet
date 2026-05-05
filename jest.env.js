@@ -1,0 +1,1 @@
+export const HF_TOKEN = 'test_token';

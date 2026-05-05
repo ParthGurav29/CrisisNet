@@ -20,6 +20,14 @@
 
     <!-- Location (still required for BLE scan on many devices) -->
     <uses-permission android:name="android.permission.ACCESS_FINE_LOCATION" />
+    <uses-permission android:name="android.permission.ACCESS_COARSE_LOCATION" />
+
+    <!-- Android 13+ Notifications -->
+    <uses-permission android:name="android.permission.POST_NOTIFICATIONS" />
+
+    <!-- Nearby Devices (Android 13+) -->
+    <uses-permission android:name="android.permission.NEARBY_WIFI_DEVICES"
+        android:usesPermissionFlags="neverForLocation" />
 
     <!-- Storage (for reading sideloaded AI model from /sdcard/Download/) -->
     <uses-permission android:name="android.permission.READ_EXTERNAL_STORAGE" android:maxSdkVersion="32" />
@@ -39,6 +47,9 @@
         android:theme="@style/AppTheme"
         android:usesCleartextTraffic="${usesCleartextTraffic}"
         android:supportsRtl="true">
+
+        <uses-native-library android:name="libOpenCL.so" android:required="false" />
+        <uses-native-library android:name="libcdsprpc.so" android:required="false" />
 
         <!-- Mesh Foreground Service -->
         <service

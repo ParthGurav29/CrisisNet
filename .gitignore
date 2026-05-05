@@ -17,6 +17,10 @@ pnpm-debug.log*
 .metro-health-check-id
 .expo/
 
+# Environment
+.env
+!.env.example
+
 # Android
 android/build/
 android/app/build/

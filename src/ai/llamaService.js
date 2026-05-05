@@ -1,32 +1,42 @@
-import {initLlama} from 'llama.rn';
+import { initLlama } from 'llama.rn';
 import RNFS from 'react-native-fs';
+import { getModelPath, setModelInUse, checkMemoryBeforeInference } from '../utils/modelStorage';
+import DeviceInfo from 'react-native-device-info';
 
 let context = null;
 let isInitializing = false;
-
-// ============================================================
-// Model path: App's EXTERNAL files directory
-// Maps to: /sdcard/Android/data/com.crisisnet/files/
-//
-// This directory is ALWAYS readable/writable by the app without
-// any runtime permissions (no scoped storage issues on Android 13+).
-//
-// To deploy the model:
-//   adb push models/gemma.gguf /sdcard/Download/gemma.gguf
-//   adb shell "mv /sdcard/Download/gemma.gguf /sdcard/Android/data/com.crisisnet/files/gemma.gguf"
-// ============================================================
-const MODEL_PATH = `${RNFS.ExternalDirectoryPath}/gemma.gguf`;
+let initReject = null;
 
 export const getIsReady = () => context !== null;
 
+export const getInitState = () => ({
+  isInitializing,
+  isReady: context !== null,
+});
+
+const getThreadCount = () => {
+  try {
+    const cores = DeviceInfo.getNumberOfCores();
+    return Math.max(1, Math.min(2, cores - 1));
+  } catch {
+    return 2;
+  }
+};
+
 export const initModel = async (onProgress) => {
   if (context) return true;
-  if (isInitializing) return false;
+  if (isInitializing) {
+    return new Promise((resolve, reject) => {
+      initReject = reject;
+    });
+  }
   isInitializing = true;
+  initReject = null;
 
   try {
     onProgress?.({ text: 'Checking for model file...', percent: 10 });
 
+    const MODEL_PATH = getModelPath();
     const exists = await RNFS.exists(MODEL_PATH);
     if (!exists) {
       console.warn('⚠️ Model not found at:', MODEL_PATH);
@@ -38,14 +48,25 @@ export const initModel = async (onProgress) => {
       return false;
     }
 
+    const memoryCheck = await checkMemoryBeforeInference();
+    if (!memoryCheck.safe) {
+      throw new Error(memoryCheck.reason || 'Insufficient memory for model loading');
+    }
+
+    setModelInUse(true);
+
     const stat = await RNFS.stat(MODEL_PATH);
     console.log('✅ Model found:', MODEL_PATH, 'size:', stat.size);
     onProgress?.({ text: 'Loading model into memory (10-30s)...', percent: 50 });
+
+    const n_threads = getThreadCount();
+    console.log(`[LLAMA] Using ${n_threads} threads`);
 
     context = await initLlama({
       model: MODEL_PATH,
       n_ctx: 256,
       n_batch: 512,
+      n_threads,
       use_mmap: true,
       use_mlock: false,
     });
@@ -53,12 +74,20 @@ export const initModel = async (onProgress) => {
     console.log('✅ Gemma loaded successfully!');
     onProgress?.({ text: 'Ready', percent: 100 });
     isInitializing = false;
+    initReject = null;
     return true;
   } catch (e) {
     console.error('❌ Model load FAILED:', e.message, e.stack);
     context = null;
     isInitializing = false;
+    setModelInUse(false);
+    const reject = initReject;
+    initReject = null;
     onProgress?.({ text: `Error: ${e.message}`, percent: 0 });
+    
+    if (reject) {
+      reject(e);
+    }
     return false;
   }
 };
@@ -77,4 +106,8 @@ export const ask = async (prompt) => {
     console.error('Inference failed:', e);
     return 'Error: ' + e.message;
   }
+};
+
+export const isModelInUse = () => {
+  return context !== null;
 };

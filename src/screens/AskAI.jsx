@@ -1,50 +1,45 @@
-import React, {useState, useEffect, useRef} from 'react';
-import {View, Text, StyleSheet, ScrollView, TextInput, TouchableOpacity, ActivityIndicator, KeyboardAvoidingView, Platform, Alert} from 'react-native';
-import {initModel, ask} from '../ai/llamaService';
+import React, { useState, useEffect, useRef, useContext } from 'react';
+import { View, Text, StyleSheet, ScrollView, TextInput, TouchableOpacity, ActivityIndicator, KeyboardAvoidingView, Platform, Alert } from 'react-native';
+import { AIContext } from '../context/AIContext';
+import { buildSurvivalPrompt } from '../ai/prompts';
+import { MeshContext } from '../context/MeshContext';
 
 export default function AskAIScreen() {
-  const [ready, setReady] = useState(false);
-  const [loading, setLoading] = useState(false);
-  const [initializing, setInitializing] = useState(true);
+  const { isModelLoaded, isGenerating, generateResponse, getStatusText, isDeviceSupported } = useContext(AIContext);
+  const { sendEmergency } = useContext(MeshContext);
   const [input, setInput] = useState('');
   const [messages, setMessages] = useState([]);
-  const [initStatus, setInitStatus] = useState('Initializing AI model...');
   const scrollRef = useRef(null);
 
-  useEffect(() => {
-    (async () => {
-      try {
-        setInitStatus('Checking model...');
-        const success = await initModel();
-        if (success) {
-          setReady(true);
-          setInitStatus('AI ready');
-        } else {
-          setInitStatus('Model initialization failed');
-        }
-      } catch (e) {
-        setInitStatus('Error: ' + e.message);
-      } finally {
-        setInitializing(false);
-      }
-    })();
-  }, []);
-
   const handleAsk = async () => {
-    if (!input.trim() || loading || !ready) return;
+    if (!input.trim() || isGenerating || !isModelLoaded) return;
     const question = input.trim();
     setInput('');
-    setMessages(prev => [...prev, {role: 'user', text: question}]);
-    setLoading(true);
+    setMessages(prev => [...prev, { role: 'user', text: question }]);
+
     try {
-      const response = await ask(question);
-      setMessages(prev => [...prev, {role: 'ai', text: response}]);
+      const prompt = buildSurvivalPrompt(question);
+      const response = await generateResponse(prompt);
+      setMessages(prev => [...prev, { role: 'ai', text: response }]);
     } catch (e) {
-      setMessages(prev => [...prev, {role: 'ai', text: 'Error: ' + e.message}]);
-    } finally {
-      setLoading(false);
+      setMessages(prev => [...prev, { role: 'ai', text: 'Error: ' + e.message }]);
     }
-    setTimeout(() => scrollRef.current?.scrollToEnd({animated: true}), 100);
+    setTimeout(() => scrollRef.current?.scrollToEnd({ animated: true }), 100);
+  };
+
+  const handleBroadcast = () => {
+    if (messages.length === 0) return;
+    const lastMessage = messages[messages.length - 1];
+    if (lastMessage.role !== 'ai') return;
+    sendEmergency({
+      desc: lastMessage.text.substring(0, 100),
+      color: 'YELLOW',
+    });
+    Alert.alert('Broadcast', 'Emergency packet sent via mesh network');
+  };
+
+  const handleClear = () => {
+    setMessages([]);
   };
 
   return (
@@ -53,9 +48,9 @@ export default function AskAIScreen() {
       behavior={Platform.OS === 'ios' ? 'padding' : undefined}
       keyboardVerticalOffset={80}>
       <View style={styles.header}>
-        <Text style={styles.title}> AI</Text>
+        <Text style={styles.title}>AI</Text>
         <Text style={styles.subtitle}>
-          {ready ? 'Powered by Gemma 2B  Offline AI' : initStatus}
+          {getStatusText()}
         </Text>
       </View>
 
@@ -63,25 +58,19 @@ export default function AskAIScreen() {
         ref={scrollRef}
         contentContainerStyle={styles.body}
         keyboardShouldPersistTaps="handled">
-        {initializing && (
-          <View style={styles.placeholder}>
-            <ActivityIndicator size="large" color="#4d9fff" />
-            <Text style={styles.placeholderText}>{initStatus}</Text>
-          </View>
-        )}
         {messages.map((msg, idx) => (
           <View
             key={idx}
             style={[styles.bubble, msg.role === 'user' ? styles.bubbleUser : styles.bubbleAI]}>
             <Text style={styles.bubbleRole}>
-              {msg.role === 'user' ? 'You' : ' Gemma'}
+              {msg.role === 'user' ? 'You' : 'Gemma'}
             </Text>
             <Text style={styles.bubbleText}>{msg.text}</Text>
           </View>
         ))}
-        {loading && (
+        {isGenerating && (
           <View style={[styles.bubble, styles.bubbleAI]}>
-            <Text style={styles.bubbleRole}> Gemma</Text>
+            <Text style={styles.bubbleRole}>Gemma</Text>
             <ActivityIndicator size="small" color="#4dff88" />
           </View>
         )}
@@ -90,21 +79,32 @@ export default function AskAIScreen() {
       <View style={styles.inputBar}>
         <TextInput
           style={styles.input}
-          placeholder={ready ? "Ask a question..." : "AI loading..."}
+          placeholder={isModelLoaded ? 'Ask a question...' : 'AI loading...'}
           placeholderTextColor="#4a5880"
           value={input}
           onChangeText={setInput}
           onSubmitEditing={handleAsk}
           returnKeyType="send"
-          editable={ready}
+          editable={isModelLoaded}
         />
-        <TouchableOpacity 
-          style={[styles.sendBtn, (!ready || !input.trim()) && styles.sendBtnDisabled]} 
-          onPress={handleAsk} 
-          disabled={!ready || !input.trim()}>
+        <TouchableOpacity
+          style={[styles.sendBtn, (!isModelLoaded || !input.trim()) && styles.sendBtnDisabled]}
+          onPress={handleAsk}
+          disabled={!isModelLoaded || !input.trim()}>
           <Text style={styles.sendBtnText}>Send</Text>
         </TouchableOpacity>
       </View>
+
+      {messages.length > 0 && (
+        <View style={styles.actionBar}>
+          <TouchableOpacity style={styles.actionBtn} onPress={handleClear}>
+            <Text style={styles.actionBtnText}>Clear</Text>
+          </TouchableOpacity>
+          <TouchableOpacity style={styles.broadcastBtn} onPress={handleBroadcast}>
+            <Text style={styles.broadcastBtnText}>Broadcast</Text>
+          </TouchableOpacity>
+        </View>
+      )}
     </KeyboardAvoidingView>
   );
 }
@@ -135,22 +135,6 @@ const styles = StyleSheet.create({
     padding: 20,
     paddingBottom: 100,
     gap: 12,
-  },
-  placeholder: {
-    backgroundColor: '#121929',
-    borderRadius: 16,
-    padding: 32,
-    alignItems: 'center',
-    borderWidth: 1,
-    borderColor: '#1e2d4a',
-    borderStyle: 'dashed',
-    marginTop: 20,
-  },
-  placeholderText: {
-    color: '#8899bb',
-    fontSize: 16,
-    fontWeight: '600',
-    marginTop: 12,
   },
   bubble: {
     borderRadius: 16,
@@ -218,5 +202,33 @@ const styles = StyleSheet.create({
     color: '#ffffff',
     fontWeight: '700',
     fontSize: 14,
+  },
+  actionBar: {
+    flexDirection: 'row',
+    justifyContent: 'space-between',
+    paddingHorizontal: 16,
+    paddingVertical: 10,
+    borderTopWidth: 1,
+    borderTopColor: '#1e2d4a',
+    backgroundColor: '#121929',
+  },
+  actionBtn: {
+    paddingHorizontal: 16,
+    paddingVertical: 8,
+  },
+  actionBtnText: {
+    color: '#6677aa',
+    fontWeight: '600',
+  },
+  broadcastBtn: {
+    backgroundColor: '#ff3b5c',
+    borderRadius: 8,
+    paddingHorizontal: 16,
+    paddingVertical: 8,
+  },
+  broadcastBtnText: {
+    color: '#ffffff',
+    fontWeight: '700',
+    fontSize: 12,
   },
 });
