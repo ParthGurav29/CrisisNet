@@ -9,7 +9,7 @@ import AskAIScreen from './screens/AskAI';
 import TriageScreen from './screens/Triage';
 import EmergencyScreen from './screens/Emergency';
 import meshService from './mesh/meshService';
-import { initModel, ask } from './ai/llamaService';
+
 
 const Tab = createBottomTabNavigator();
 
@@ -64,16 +64,6 @@ export default function App() {
     initApp();
   }, []);
 
-  useEffect(() => {
-    // Initialize model immediately
-    initModel().then(async (success) => {
-      console.log("Model init success:", success);
-      if (success) {
-        const res = await ask("Give quick emergency advice");
-        console.log("🤖 Gemma Test Call:", res);
-      }
-    }).catch(e => console.error("Init error:", e));
-  }, []);
 
   return (
     <NavigationContainer>

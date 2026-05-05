@@ -1,23 +1,37 @@
 import React, {useState, useEffect, useRef} from 'react';
-import {View, Text, StyleSheet, ScrollView, TextInput, TouchableOpacity, ActivityIndicator, KeyboardAvoidingView, Platform} from 'react-native';
+import {View, Text, StyleSheet, ScrollView, TextInput, TouchableOpacity, ActivityIndicator, KeyboardAvoidingView, Platform, Alert} from 'react-native';
 import {initModel, ask} from '../ai/llamaService';
 
 export default function AskAIScreen() {
   const [ready, setReady] = useState(false);
   const [loading, setLoading] = useState(false);
+  const [initializing, setInitializing] = useState(true);
   const [input, setInput] = useState('');
   const [messages, setMessages] = useState([]);
+  const [initStatus, setInitStatus] = useState('Initializing AI model...');
   const scrollRef = useRef(null);
 
   useEffect(() => {
     (async () => {
-      const success = await initModel();
-      if (success) setReady(true);
+      try {
+        setInitStatus('Checking model...');
+        const success = await initModel();
+        if (success) {
+          setReady(true);
+          setInitStatus('AI ready');
+        } else {
+          setInitStatus('Model initialization failed');
+        }
+      } catch (e) {
+        setInitStatus('Error: ' + e.message);
+      } finally {
+        setInitializing(false);
+      }
     })();
   }, []);
 
   const handleAsk = async () => {
-    if (!input.trim() || loading) return;
+    if (!input.trim() || loading || !ready) return;
     const question = input.trim();
     setInput('');
     setMessages(prev => [...prev, {role: 'user', text: question}]);
@@ -39,9 +53,9 @@ export default function AskAIScreen() {
       behavior={Platform.OS === 'ios' ? 'padding' : undefined}
       keyboardVerticalOffset={80}>
       <View style={styles.header}>
-        <Text style={styles.title}>🤖 Ask AI</Text>
+        <Text style={styles.title}> AI</Text>
         <Text style={styles.subtitle}>
-          {ready ? 'Powered by Gemma · Runs fully offline' : 'Loading model...'}
+          {ready ? 'Powered by Gemma 2B  Offline AI' : initStatus}
         </Text>
       </View>
 
@@ -49,10 +63,10 @@ export default function AskAIScreen() {
         ref={scrollRef}
         contentContainerStyle={styles.body}
         keyboardShouldPersistTaps="handled">
-        {messages.length === 0 && !ready && (
+        {initializing && (
           <View style={styles.placeholder}>
             <ActivityIndicator size="large" color="#4d9fff" />
-            <Text style={styles.placeholderText}>Initializing Gemma model...</Text>
+            <Text style={styles.placeholderText}>{initStatus}</Text>
           </View>
         )}
         {messages.map((msg, idx) => (
@@ -60,14 +74,14 @@ export default function AskAIScreen() {
             key={idx}
             style={[styles.bubble, msg.role === 'user' ? styles.bubbleUser : styles.bubbleAI]}>
             <Text style={styles.bubbleRole}>
-              {msg.role === 'user' ? 'You' : '🧠 Gemma'}
+              {msg.role === 'user' ? 'You' : ' Gemma'}
             </Text>
             <Text style={styles.bubbleText}>{msg.text}</Text>
           </View>
         ))}
         {loading && (
           <View style={[styles.bubble, styles.bubbleAI]}>
-            <Text style={styles.bubbleRole}>🧠 Gemma</Text>
+            <Text style={styles.bubbleRole}> Gemma</Text>
             <ActivityIndicator size="small" color="#4dff88" />
           </View>
         )}
@@ -76,7 +90,7 @@ export default function AskAIScreen() {
       <View style={styles.inputBar}>
         <TextInput
           style={styles.input}
-          placeholder="Ask a survival or medical question..."
+          placeholder={ready ? "Ask a question..." : "AI loading..."}
           placeholderTextColor="#4a5880"
           value={input}
           onChangeText={setInput}
@@ -84,7 +98,10 @@ export default function AskAIScreen() {
           returnKeyType="send"
           editable={ready}
         />
-        <TouchableOpacity style={styles.sendBtn} onPress={handleAsk} disabled={!ready || !input.trim()}>
+        <TouchableOpacity 
+          style={[styles.sendBtn, (!ready || !input.trim()) && styles.sendBtnDisabled]} 
+          onPress={handleAsk} 
+          disabled={!ready || !input.trim()}>
           <Text style={styles.sendBtnText}>Send</Text>
         </TouchableOpacity>
       </View>
@@ -157,6 +174,7 @@ const styles = StyleSheet.create({
     fontWeight: '700',
     marginBottom: 6,
     textTransform: 'uppercase',
+    color: '#4d9fff',
   },
   bubbleText: {
     color: '#e0e8ff',
@@ -192,6 +210,9 @@ const styles = StyleSheet.create({
     borderRadius: 20,
     paddingHorizontal: 18,
     paddingVertical: 10,
+  },
+  sendBtnDisabled: {
+    backgroundColor: '#1a3a6e',
   },
   sendBtnText: {
     color: '#ffffff',
