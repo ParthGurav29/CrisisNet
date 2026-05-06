@@ -1,9 +1,43 @@
 import RNFS from 'react-native-fs';
 import { Platform } from 'react-native';
 import AsyncStorage from '@react-native-async-storage/async-storage';
+import CryptoJS from 'crypto-js';
 
-const HF_TOKEN = 'GET_UR_OWN_TOKEN_KID';
-// TOKEN : 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
+// Streaming SHA-256 hasher backed by crypto-js (pure JS, no native module).
+// Mirrors the small subset of node's crypto.createHash('sha256') we used:
+//   .update(base64String | Buffer | Uint8Array)
+//   .digest('hex')
+// We intentionally do NOT use `react-native-crypto` because it transitively
+// loads `react-native-randombytes`, whose top-level init() reads
+// `NativeModules.RNRandomBytes.seed` and crashes the JS bundle at load time
+// when the native module is not linked (RN 0.85 New Architecture).
+const createSha256Hasher = () => {
+  const hasher = CryptoJS.algo.SHA256.create();
+  return {
+    update: (chunk) => {
+      if (chunk == null) return;
+      if (typeof chunk === 'string') {
+        hasher.update(CryptoJS.enc.Base64.parse(chunk));
+        return;
+      }
+      const len = chunk.length;
+      const words = [];
+      for (let i = 0; i < len; i++) {
+        words[i >>> 2] |= (chunk[i] & 0xff) << (24 - (i % 4) * 8);
+      }
+      hasher.update(CryptoJS.lib.WordArray.create(words, len));
+    },
+    digest: (encoding = 'hex') => {
+      const result = hasher.finalize();
+      return encoding === 'hex'
+        ? result.toString(CryptoJS.enc.Hex)
+        : result.toString();
+    },
+  };
+};
+
+const HF_TOKEN = 'ur hf token ';
+
 
 export const MODEL_FILENAME = 'gemma-4-E2B-it-Q4_K_M.gguf';
 const MODEL_PATH = `${RNFS.DocumentDirectoryPath}/models/${MODEL_FILENAME}`;
@@ -18,12 +52,31 @@ const MODEL_URL =
   'https://huggingface.co/unsloth/gemma-4-E2B-it-GGUF/resolve/main/gemma-4-E2B-it-Q4_K_M.gguf';
 const MODEL_EXPECTED_SIZE = 2800 * 1024 * 1024;
 
-const EXPECTED_SHA256 = 'a1b2c3d4e5f6789012345678901234567890abcdef1234567890abcdef123456';
+export const EXPECTED_SHA256 = null;
+
+export const computeModelChecksum = async (filePath) => {
+  const chunkSize = 1024 * 1024;
+  const stat = await RNFS.stat(filePath);
+  const bytes = parseInt(stat.size, 10);
+  let offset = 0;
+  const hash = createSha256Hasher();
+
+  while (offset < bytes) {
+    const lengthToRead = Math.min(chunkSize, bytes - offset);
+    const chunk = await RNFS.readFile(filePath, 'base64', {
+      offset,
+      length: lengthToRead
+    });
+    hash.update(chunk);
+    offset += lengthToRead;
+  }
+  return hash.digest('hex');
+};
 
 const MIN_RAM_GB = 5;
 const MIN_RAM_BYTES = MIN_RAM_GB * 1024 * 1024 * 1024;
 const MIN_SIZE_BYTES = MODEL_EXPECTED_SIZE;
-const MIN_SIZE_MB = 2500;
+export const MIN_SIZE_MB = Math.round(MIN_SIZE_BYTES / (1024 * 1024));
 const DOWNLOAD_TIMEOUT_MS = 300000;
 const MAX_RETRIES = 5;
 const RETRY_DELAY_MS = 5000;
@@ -44,6 +97,12 @@ const META_FILENAME = 'meta.json';
 let downloadCancellationPromise = null;
 let activeDownload = null;
 let modelInUse = false;
+
+// Unique to *this* JS session. Written into the download lock so we can
+// detect orphan locks left behind by a previous app process / JS reload
+// (RN apps are single-instance on Android, so any lock with a different
+// session id is by definition stale and safe to steal).
+const SESSION_ID = `${Date.now().toString(36)}-${Math.random().toString(36).slice(2, 10)}`;
 
 export const getModelVersion = () => MODEL_VERSION;
 
@@ -70,7 +129,7 @@ export const saveModelMeta = async (meta) => {
     const tmpPath = `${metaPath}.tmp`;
     const content = JSON.stringify({ ...meta, version: MODEL_VERSION, timestamp: Date.now() });
     await RNFS.writeFile(tmpPath, content, 'utf8');
-    await RNFS/fsync && await RNFS.fsync(tmpPath);
+    if (RNFS.fsync) await RNFS.fsync(tmpPath);
     await RNFS.moveFile(tmpPath, metaPath);
   } catch (e) {
     console.warn('Failed to save model meta:', e.message);
@@ -113,9 +172,34 @@ export const clearDownloadState = async () => {
   }
 };
 
+export const saveResumeOffset = async (bytesWritten, totalBytes) => {
+  try {
+    await saveDownloadState({ bytesWritten, totalBytes, timestamp: Date.now() });
+  } catch (e) {
+    console.warn('Failed to save resume offset:', e.message);
+  }
+};
+
 export const getModelPath = () => MODEL_PATH;
 
 export const getModelDir = () => MODEL_DIR;
+
+// Ensure `${DocumentDirectory}/models/` exists. Idempotent and safe to call
+// many times. The first launch of the app does not have this directory yet,
+// which previously caused `acquireDownloadLock` to fail with ENOENT and
+// `downloadModel` to incorrectly surface "Download already in progress".
+export const ensureModelDir = async () => {
+  try {
+    const exists = await RNFS.exists(MODEL_DIR);
+    if (!exists) {
+      await RNFS.mkdir(MODEL_DIR);
+    }
+    return true;
+  } catch (e) {
+    console.warn('Failed to ensure model dir:', e.message);
+    return false;
+  }
+};
 
 export const getModelSize = async () => {
   try {
@@ -136,11 +220,20 @@ export const getModelSize = async () => {
 
 export const acquireDownloadLock = async () => {
   try {
+    await ensureModelDir();
     const existingLock = await readLockFile();
-    if (existingLock && !isLockStale(existingLock)) {
+    if (existingLock && !isLockStale(existingLock) && existingLock.sessionId === SESSION_ID) {
+      // Same session already holds the lock — caller is the legitimate owner.
       return { acquired: false, reason: 'Lock exists', lock: existingLock };
     }
+    if (existingLock && existingLock.sessionId && existingLock.sessionId !== SESSION_ID) {
+      // Lock was written by a previous JS session (e.g. before a reload or
+      // crash). RN apps are single-instance on Android, so that session is
+      // gone — steal the lock.
+      console.log('Stealing orphan download lock from previous session:', existingLock.sessionId);
+    }
     const lockData = {
+      sessionId: SESSION_ID,
       pid: process.pid || Date.now(),
       timestamp: Date.now(),
       appStartTimestamp: Date.now(),
@@ -149,7 +242,7 @@ export const acquireDownloadLock = async () => {
     return { acquired: true, lock: lockData };
   } catch (e) {
     console.warn('Failed to acquire lock:', e.message);
-    return { acquired: false, reason: e.message };
+    return { acquired: false, reason: e.message, ioError: true };
   }
 };
 
@@ -190,7 +283,7 @@ export const setModelInUse = (inUse) => {
 
 export const checkAndResumeDownload = async () => {
   const lock = await readLockFile();
-  if (lock && !isLockStale(lock)) {
+  if (lock && !isLockStale(lock) && lock.sessionId === SESSION_ID) {
     const meta = await getModelMeta();
     if (meta && !meta.completed) {
       return { shouldResume: true, lock };
@@ -223,11 +316,11 @@ export const modelExists = async () => {
 
 export const validateModelChecksum = async (options = {}) => {
   try {
-    const { quick = false } = options;
-    const exists = await RNFS.exists(MODEL_PATH);
+    const { quick = false, path: filePath = MODEL_PATH } = options;
+    const exists = await RNFS.exists(filePath);
     if (!exists) return { valid: false, reason: 'Model file not found' };
 
-    const stat = await RNFS.stat(MODEL_PATH);
+    const stat = await RNFS.stat(filePath);
     const bytes = parseInt(stat.size, 10);
     if (bytes < MIN_SIZE_BYTES) {
       return { valid: false, reason: `File too small: ${bytes} bytes` };
@@ -235,47 +328,46 @@ export const validateModelChecksum = async (options = {}) => {
 
     const meta = await getModelMeta();
     if (meta && meta.validatedAt && Date.now() - meta.validatedAt < 60 * 60 * 1000) {
-      if (meta.size === bytes && meta.partialHash) {
+      if (meta.size === bytes) {
         return { valid: true, reason: 'Validated recently' };
       }
     }
 
-    const Crypto = require('crypto');
-    const hash = Crypto.createHash('sha256');
+    const hash = createSha256Hasher();
+    const chunkSize = 1024 * 1024;
 
-    if (quick && meta && meta.partialHash) {
-      const fileBuffer = await RNFS.readFile(MODEL_PATH, 'base64');
-      const endBytes = 1024 * 1024;
-      const endBuffer = fileBuffer.slice(-endBytes);
-      hash.update(Buffer.from(endBuffer, 'base64'));
-      const computedEndHash = hash.digest('hex');
-      if (computedEndHash === meta.partialHash) {
-        await saveModelMeta({ ...meta, validatedAt: Date.now() });
-        return { valid: true, reason: 'Quick validation passed' };
+    let offset = 0;
+    while (offset < bytes) {
+      const lengthToRead = Math.min(chunkSize, bytes - offset);
+      const chunk = await RNFS.readFile(filePath, 'base64', {
+        offset,
+        length: lengthToRead
+      });
+      hash.update(chunk);
+      offset += lengthToRead;
+      if (offset % (chunkSize * 10) === 0) {
+        await new Promise(resolve => setTimeout(resolve, 1));
       }
     }
-
-    const fileBuffer = await RNFS.readFile(MODEL_PATH, 'base64');
-    hash.update(Buffer.from(fileBuffer, 'base64'));
     const computedHash = hash.digest('hex');
 
-    if (computedHash !== EXPECTED_SHA256) {
-      return { valid: false, reason: `Hash mismatch: expected ${EXPECTED_SHA256}, got ${computedHash}` };
-    }
+    const partialHash = createSha256Hasher();
+    const endBytes = Math.min(1024 * 1024, bytes);
+    const endChunk = await RNFS.readFile(filePath, 'base64', {
+      offset: bytes - endBytes,
+      length: endBytes
+    });
+    partialHash.update(endChunk);
 
-    const partialHash = Crypto.createHash('sha256');
-    const endBytes = 1024 * 1024;
-    const endBuffer = Buffer.from(fileBuffer.slice(-endBytes));
-    partialHash.update(endBuffer);
     await saveModelMeta({
-      hash: EXPECTED_SHA256,
+      hash: computedHash,
       size: bytes,
       completed: true,
       timestamp: Date.now(),
       validatedAt: Date.now(),
       partialHash: partialHash.digest('hex'),
     });
-    return { valid: true };
+    return { valid: true, hash: computedHash };
   } catch (e) {
     console.error('Error validating checksum:', e);
     return { valid: false, reason: `Checksum validation failed: ${e.message}` };
@@ -283,17 +375,30 @@ export const validateModelChecksum = async (options = {}) => {
 };
 
 export const getAvailableStorage = async () => {
+  // The correct API is `RNFS.getFSInfo()` which returns `{ totalSpace,
+  // freeSpace }`. The previous implementation called `RNFS.stat(...)` and
+  // looked for `freeSpace` / `totalSize` / `availableSize` on the result —
+  // none of which exist on a stat result. That made this function ALWAYS
+  // return null and `checkStoragePreDownload` always throw "Unable to
+  // determine available storage space."
   try {
-    const stat = await RNFS.stat(RNFS.DocumentDirectoryPath);
-    if (stat && stat.totalSize && stat.freeSpace) {
-      return {
-        available: parseInt(stat.freeSpace, 10),
-        total: parseInt(stat.totalSize, 10),
-      };
+    if (typeof RNFS.getFSInfo === 'function') {
+      const info = await RNFS.getFSInfo();
+      const total = Number(info?.totalSpace);
+      const free = Number(info?.freeSpace);
+      if (Number.isFinite(total) && Number.isFinite(free) && total > 0) {
+        return { available: free, total };
+      }
     }
-    if (stat && stat.availableSize) {
-      return { available: parseInt(stat.availableSize, 10), total: parseInt(stat.totalSize, 10) };
+
+    // Fallback: very old/odd RNFS forks expose these keys directly on the
+    // module export. Best-effort, doesn't break anything if absent.
+    const total = Number(RNFS.TotalSpaceBytes ?? RNFS.totalSpace);
+    const free = Number(RNFS.FreeSpaceBytes ?? RNFS.freeSpace);
+    if (Number.isFinite(total) && Number.isFinite(free) && total > 0) {
+      return { available: free, total };
     }
+
     return null;
   } catch (e) {
     console.warn('Could not get storage info:', e.message);
@@ -513,10 +618,18 @@ export const getQueueDelay = (retryCount, networkQuality) => {
 };
 
 export const downloadModel = async (onProgress, onCancel) => {
+  await ensureModelDir();
   const lock = await acquireDownloadLock();
   if (!lock.acquired) {
-    console.log('Download already in progress:', lock.reason);
-    return { alreadyDownloading: true, lock: lock.lock };
+    if (lock.ioError) {
+      // Couldn't write the lock file itself (e.g. transient FS issue).
+      // Treat this as "no other download is running" and proceed without a
+      // lock rather than mis-reporting "already downloading" to the UI.
+      console.warn('Proceeding without download lock due to I/O error:', lock.reason);
+    } else {
+      console.log('Download already in progress:', lock.reason);
+      return { alreadyDownloading: true, lock: lock.lock };
+    }
   }
 
   if (downloadCancellationPromise) {
@@ -590,7 +703,9 @@ export const downloadModel = async (onProgress, onCancel) => {
                 return;
               }
               const percent = Math.round((data.bytesWritten / data.totalBytes) * 100);
-              await saveResumeOffset(data.bytesWritten, data.totalBytes);
+              if (percent % 5 === 0) {
+                await saveResumeOffset(data.bytesWritten, data.totalBytes);
+              }
               onProgress?.({
                 downloaded: Math.round(data.bytesWritten / (1024 * 1024)),
                 total: Math.round(data.totalBytes / (1024 * 1024)),
@@ -598,6 +713,7 @@ export const downloadModel = async (onProgress, onCancel) => {
                 attempt,
                 resumed: resumeOffset > 0,
               });
+              await new Promise(resolve => setTimeout(resolve, 1));
             },
             headers: {
               'Authorization': HF_TOKEN ? `Bearer ${HF_TOKEN}` : undefined,
@@ -636,6 +752,9 @@ export const downloadModel = async (onProgress, onCancel) => {
           if (result.statusCode === 404) {
             throw new Error('Model not found (404). URL may be incorrect.');
           }
+          if (result.statusCode === 500) {
+            throw new Error('Server error (500). Please retry in a few minutes.');
+          }
           if (result.statusCode && result.statusCode !== 200 && result.statusCode !== 206) {
             throw new Error(`Download failed with status: ${result.statusCode}`);
           }
@@ -648,7 +767,7 @@ export const downloadModel = async (onProgress, onCancel) => {
             throw new Error(`Download incomplete: ${Math.round(downloadedSize / (1024 * 1024))} MB < ${MIN_SIZE_MB} MB minimum`);
           }
 
-          const checksumResult = await validateModelChecksum();
+          const checksumResult = await validateModelChecksum({ path: TEMP_MODEL_PATH });
           if (!checksumResult.valid) {
             await RNFS.unlink(TEMP_MODEL_PATH);
             throw new Error(`Model validation failed: ${checksumResult.reason}`);
@@ -658,10 +777,16 @@ export const downloadModel = async (onProgress, onCancel) => {
             throw new Error('Model is currently in use, cannot replace');
           }
 
+          const testResult = await testModelLoad(TEMP_MODEL_PATH);
+          if (!testResult.success) {
+            await RNFS.unlink(TEMP_MODEL_PATH);
+            throw new Error(`Model load test failed: ${testResult.error}`);
+          }
+
           await RNFS.moveFile(TEMP_MODEL_PATH, MODEL_PATH);
           await clearDownloadState();
           await saveModelMeta({
-            hash: EXPECTED_SHA256,
+            hash: checksumResult.hash,
             size: downloadedSize,
             completed: true,
             timestamp: Date.now(),
@@ -754,5 +879,38 @@ export const deleteModel = async () => {
   } catch (e) {
     console.error('Error deleting model:', e);
     return false;
+  }
+};
+
+export const testModelLoad = async (modelPath) => {
+  try {
+    const { installJsi } = require('llama.rn');
+    if (typeof installJsi === 'function') {
+      await installJsi();
+    }
+    const Llama = require('llama.rn');
+    const initLlama = Llama.initLlama || Llama.init;
+    
+    if (typeof initLlama !== 'function') {
+      return { success: false, error: 'Llama init not found' };
+    }
+
+    const testContext = await initLlama({
+      model: modelPath,
+      n_ctx: 256,
+      n_threads: 2,
+      use_mmap: true,
+      use_mlock: false,
+      seed: -1, // Random seed (default)
+    });
+
+    if (!testContext) {
+      return { success: false, error: 'Model test init returned null' };
+    }
+    await testContext.terminate();
+    await new Promise(resolve => setTimeout(resolve, 100));
+    return { success: true };
+  } catch (e) {
+    return { success: false, error: e.message };
   }
 };

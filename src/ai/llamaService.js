@@ -1,4 +1,3 @@
-import { initLlama } from 'llama.rn';
 import RNFS from 'react-native-fs';
 import { getModelPath, setModelInUse, checkMemoryBeforeInference } from '../utils/modelStorage';
 import DeviceInfo from 'react-native-device-info';
@@ -23,6 +22,13 @@ const getThreadCount = () => {
   }
 };
 
+const ensureJsiReady = async () => {
+  const { installJsi } = require('llama.rn');
+  if (typeof installJsi === 'function') {
+    await installJsi();
+  }
+};
+
 export const initModel = async (onProgress) => {
   if (context) return true;
   if (isInitializing) {
@@ -34,6 +40,8 @@ export const initModel = async (onProgress) => {
   initReject = null;
 
   try {
+    await ensureJsiReady();
+
     onProgress?.({ text: 'Checking for model file...', percent: 10 });
 
     const MODEL_PATH = getModelPath();
@@ -62,14 +70,28 @@ export const initModel = async (onProgress) => {
     const n_threads = getThreadCount();
     console.log(`[LLAMA] Using ${n_threads} threads`);
 
-    context = await initLlama({
+    const Llama = require('llama.rn');
+    const initLlama = Llama.initLlama || Llama.init;
+
+    if (typeof initLlama !== 'function') {
+      throw new Error('Llama initialization function not found');
+    }
+
+    const config = {
       model: MODEL_PATH,
       n_ctx: 256,
       n_batch: 512,
       n_threads,
       use_mmap: true,
       use_mlock: false,
-    });
+      seed: -1, // Random seed (default)
+    };
+
+    context = await initLlama(config);
+
+    if (!context) {
+      throw new Error('Model initialization returned null - check model file validity');
+    }
 
     console.log('✅ Gemma loaded successfully!');
     onProgress?.({ text: 'Ready', percent: 100 });
@@ -96,6 +118,9 @@ export const ask = async (prompt) => {
   if (!context) return 'Model not ready. Please wait...';
 
   try {
+    if (typeof context.completion !== 'function') {
+      throw new Error('Context completion method not available');
+    }
     const res = await context.completion({
       prompt: `Question: ${prompt}\n\nAnswer:`,
       n_predict: 150,

@@ -1,12 +1,14 @@
 import React, { useState, useEffect, useRef } from 'react';
 import { View, Text, StyleSheet, TouchableOpacity } from 'react-native';
 import { Bar } from 'react-native-progress';
-import { downloadModel, modelExists } from '../utils/modelStorage';
+import { downloadModel, modelExists, MODEL_EXPECTED_SIZE } from '../utils/modelStorage';
+
+const MIN_SIZE_MB = Math.round(MODEL_EXPECTED_SIZE / (1024 * 1024));
 
 export default function ModelDownloadScreen({ navigation }) {
   const [progress, setProgress] = useState(0);
   const [downloadedMB, setDownloadedMB] = useState(0);
-  const [totalMB, setTotalMB] = useState(2500);
+  const [totalMB, setTotalMB] = useState(MIN_SIZE_MB);
   const [isDownloading, setIsDownloading] = useState(false);
   const [error, setError] = useState(null);
   const [status, setStatus] = useState('ready');
@@ -91,13 +93,12 @@ export default function ModelDownloadScreen({ navigation }) {
 
     try {
       setStatus('verifying');
-      const success = await downloadModel(onProgress);
-      if (success) {
+      const result = await downloadModel(onProgress);
+      if (result === true) {
         setStatus('complete');
         setTimeout(() => navigation.replace('Home'), 500);
       } else {
-        setError('Download failed. Please try again.');
-        setStatus('error');
+        throw new Error(result?.error || 'Download failed');
       }
     } catch (e) {
       setError(e.message || 'Download failed');
@@ -120,7 +121,7 @@ export default function ModelDownloadScreen({ navigation }) {
         <View style={styles.warningBox}>
           <Text style={styles.warningTitle}>⚠️ Large Download</Text>
           <Text style={styles.warningText}>
-            ~2.5GB file — WiFi strongly recommended
+            ~{MIN_SIZE_MB} GB file — WiFi strongly recommended
           </Text>
         </View>
 

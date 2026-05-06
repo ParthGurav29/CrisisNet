@@ -1,4 +1,3 @@
-import { initLlama } from 'llama.rn';
 import RNFS from 'react-native-fs';
 import { getModelPath } from '../utils/modelStorage';
 import { getEmergencyResponse } from './offlineResponses';
@@ -32,7 +31,12 @@ export const getInitError = () => initError;
 export const getContext = () => context;
 
 const isLlamaAvailable = () => {
-  return typeof initLlama === 'function';
+  try {
+    const { initLlama } = require('llama.rn');
+    return typeof initLlama === 'function';
+  } catch {
+    return false;
+  }
 };
 
 const getOptimalThreadCount = () => {
@@ -62,6 +66,17 @@ const setupMemoryPressureHandler = () => {
   });
 };
 
+const ensureJsiReady = async () => {
+  try {
+    const { installJsi } = require('llama.rn');
+    if (typeof installJsi === 'function') {
+      await installJsi();
+    }
+  } catch (e) {
+    console.warn('JSI install skipped:', e.message);
+  }
+};
+
 export const loadModel = async (onProgress) => {
   if (context) return { success: true };
   if (isInitializing) return { success: false, error: 'Already initializing' };
@@ -79,6 +94,7 @@ export const loadModel = async (onProgress) => {
   };
 
   try {
+    await ensureJsiReady();
     safeProgress({ stage: 'Checking AI runtime', percent: 5 });
 
     if (!isLlamaAvailable()) {
@@ -121,15 +137,26 @@ export const loadModel = async (onProgress) => {
     safeProgress({ stage: 'Initializing runtime', percent: 30 });
 
     const n_threads = getOptimalThreadCount();
+    const Llama = require('llama.rn');
+    const initLlama = Llama.initLlama || Llama.init;
 
-    context = await initLlama({
+    if (typeof initLlama !== 'function') {
+      throw new Error('Llama initialization function not found. Ensure llama.rn is properly installed.');
+    }
+
+    const config = {
       model: MODEL_PATH,
       n_ctx: 512,
       n_threads,
       n_gpu_layers: 0,
       use_mmap: true,
       use_mlock: false,
-    });
+      seed: -1, // Random seed (default)
+    };
+
+    console.log('[LLAMA] Calling init with config:', JSON.stringify({ ...config, model: 'REDACTED' }));
+    
+    context = await initLlama(config);
 
     if (!context) {
       throw new Error('initLlama returned null');
@@ -165,6 +192,9 @@ export const loadModel = async (onProgress) => {
 export const generateResponse = async (prompt, maxTokens = 150) => {
   if (context && !isUsingFallback) {
     try {
+      if (typeof context.completion !== 'function') {
+        throw new Error('Context completion method not available');
+      }
       const res = await context.completion({
         prompt,
         n_predict: maxTokens,

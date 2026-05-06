@@ -1,7 +1,7 @@
 import React, { useState, useEffect } from 'react';
 import { View, Text, StyleSheet, StatusBar, TouchableOpacity, Alert, Platform, Linking, Animated } from 'react-native';
 import { useMesh } from '../hooks/useMesh';
-import { BleManager } from 'react-native-ble-manager';
+import { checkBlePermissions } from '../utils/permissions';
 
 export default function HomeScreen({ navigation }) {
   const { nodes, isConnected, lastMessageTime, scanning, advertising } = useMesh();
@@ -14,9 +14,9 @@ export default function HomeScreen({ navigation }) {
 
   const checkBluetoothStatus = async () => {
     try {
-      const enabled = await BleManager.checkState();
-      setIsBluetoothEnabled(enabled === 'On');
-      if (enabled !== 'On') {
+      const result = await checkBlePermissions();
+      setIsBluetoothEnabled(Boolean(result.granted));
+      if (!result.granted) {
         setTimeout(() => openBluetoothSettings(), 500);
       }
     } catch (err) {

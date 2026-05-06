@@ -51,11 +51,12 @@
         <uses-native-library android:name="libOpenCL.so" android:required="false" />
         <uses-native-library android:name="libcdsprpc.so" android:required="false" />
 
-        <!-- Mesh Foreground Service -->
-        <service
-            android:name="com.offlineprotocol.MeshForegroundService"
-            android:foregroundServiceType="connectedDevice"
-            android:exported="false" />
+        <!--
+          Mesh foreground service is provided by @offline-protocol/mesh-sdk
+          and merged in from its AndroidManifest.xml as
+          `com.offlineprotocol.MeshForegroundService` with
+          foregroundServiceType="connectedDevice". Do not redeclare here.
+        -->
 
         <!-- Main Activity -->
         <activity

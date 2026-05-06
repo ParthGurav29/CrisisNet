@@ -29,6 +29,12 @@ export const MeshProvider = ({ children }) => {
   const isMountedRef = useRef(true);
   const listenersInitializedRef = useRef(false);
   const meshRestartingRef = useRef(false);
+  // NOTE: keep all useRef calls grouped here. Adding useRef calls AFTER
+  // the useCallback block changes the hook ordering between renders and
+  // breaks Fast Refresh with "Rendered more hooks than during the previous
+  // render".
+  const initInFlightRef = useRef(false);
+  const initAttemptedRef = useRef(false);
 
   const handlePeerDiscovered = useCallback((peer) => {
     setNodes((prev) => {
@@ -119,13 +125,17 @@ export const MeshProvider = ({ children }) => {
   }, []);
 
   const initMesh = useCallback(async () => {
-    if (meshState !== MeshState.IDLE && meshState !== MeshState.FAILED) {
-      return; // Already initializing or ready
-    }
-    
+    // Guard: only the first call from useEffect should run init.
+    // Subsequent retries must go through `restartMesh` (the user-initiated
+    // path) so a transient failure doesn't enter an init -> FAILED -> init
+    // loop on devices/emulators without Bluetooth.
+    if (initInFlightRef.current || initAttemptedRef.current) return;
+    initInFlightRef.current = true;
+    initAttemptedRef.current = true;
+
     setMeshState(MeshState.INITIALIZING);
     setMeshError(false);
-    
+
     try {
       await db.init();
       const savedMessages = await getMessages();
@@ -137,37 +147,45 @@ export const MeshProvider = ({ children }) => {
         setMyShortId(shortId);
       }
       await meshService.init();
-      setMeshState(MeshState.READY);
-      setMeshError(false);
-      
+      if (isMountedRef.current) {
+        setMeshState(MeshState.READY);
+        setMeshError(false);
+      }
+
       meshService.flushQueue();
     } catch (e) {
-      console.error('[MeshContext] Init failed:', e);
+      console.error('[MeshContext] Init failed:', e?.message || e);
       if (isMountedRef.current) {
         setMeshError(true);
         setMeshState(MeshState.FAILED);
       }
+    } finally {
+      initInFlightRef.current = false;
     }
-  }, [meshState]);
+  }, []);
 
   const restartMesh = useCallback(async () => {
     if (meshRestartingRef.current) return;
     meshRestartingRef.current = true;
-    
+
     setMeshState(MeshState.INITIALIZING);
     setMeshError(false);
-    
+
     try {
       await meshService.stop();
       await meshService.init();
-      setMeshState(MeshState.READY);
-      setMeshError(false);
-      
+      if (isMountedRef.current) {
+        setMeshState(MeshState.READY);
+        setMeshError(false);
+      }
+
       meshService.flushQueue();
     } catch (e) {
-      console.error('[MeshContext] Restart failed:', e);
-      setMeshState(MeshState.FAILED);
-      setMeshError(true);
+      console.error('[MeshContext] Restart failed:', e?.message || e);
+      if (isMountedRef.current) {
+        setMeshState(MeshState.FAILED);
+        setMeshError(true);
+      }
     } finally {
       meshRestartingRef.current = false;
     }
