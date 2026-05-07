@@ -7,6 +7,13 @@ apply plugin: "com.facebook.react"
  * By default you don't need to apply any configuration, just uncomment the lines you need.
  */
 react {
+    /**
+     * Default: ["debug", "debugOptimized"] — those variants do NOT embed JS; the app expects Metro.
+     * Empty list = bundle JS for every variant so APKs work when installed without `npx react-native start`.
+     * Without this, debug APKs show "Unable to load script" on a physical device.
+     */
+    debuggableVariants = []
+
     /* Folders */
     //   The root of your project, i.e. where "package.json" lives. Default is '../..'
     // root = file("../../")
@@ -94,9 +101,6 @@ android {
         versionCode 1
         versionName "1.0"
     }
-    aaptOptions {
-        noCompress "gguf"
-    }
     signingConfigs {
         debug {
             storeFile file('debug.keystore')
@@ -117,6 +121,32 @@ android {
             proguardFiles getDefaultProguardFile("proguard-android.txt"), "proguard-rules.pro"
         }
     }
+}
+
+def ensureSourceAssetsPolicyTask = tasks.register("ensureSourceAssetsPolicy") {
+    doLast {
+        def assetsDir = file("${projectDir}/src/main/assets")
+        def staleJsBundle = file("${assetsDir}/index.android.bundle")
+        if (staleJsBundle.exists()) {
+            throw new GradleException(
+                "Remove ${staleJsBundle} from source control. " +
+                "A committed index.android.bundle ships stale JavaScript (e.g. old asset model extraction) and overrides Metro / release bundling. " +
+                "Debug: use Metro (npx react-native start). Release: Gradle generates the bundle into build outputs."
+            )
+        }
+        def ggufInAssets = fileTree(assetsDir) {
+            include "**/*.gguf"
+        }.files
+        if (!ggufInAssets.isEmpty()) {
+            throw new GradleException(
+                "Bundled GGUF detected in src/main/assets: ${ggufInAssets}. Remove and use runtime model download."
+            )
+        }
+    }
+}
+
+tasks.matching { it.name.startsWith("merge") && it.name.endsWith("Assets") }.configureEach {
+    dependsOn ensureSourceAssetsPolicyTask
 }
 
 dependencies {
