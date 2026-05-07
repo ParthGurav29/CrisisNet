@@ -43,6 +43,7 @@ export const MODEL_FILENAME = 'gemma-4-E2B-it-Q4_K_M.gguf';
 const MODEL_PATH = `${RNFS.DocumentDirectoryPath}/models/${MODEL_FILENAME}`;
 const MODEL_DIR = `${RNFS.DocumentDirectoryPath}/models`;
 const TEMP_MODEL_PATH = `${RNFS.DocumentDirectoryPath}/models/${MODEL_FILENAME}.tmp`;
+const BUNDLED_ASSET_MODEL_PATH = 'models/gemma.gguf';
 const LOCK_PATH = `${RNFS.DocumentDirectoryPath}/models/download.lock`;
 const DOWNLOAD_STATE_KEY = 'download_state';
 const ACK_DEDUPE_KEY = 'ack_dedupe';
@@ -51,6 +52,7 @@ const RETRY_BUDGET_KEY = 'retry_budget';
 const MODEL_URL =
   'https://huggingface.co/unsloth/gemma-4-E2B-it-GGUF/resolve/main/gemma-4-E2B-it-Q4_K_M.gguf';
 const MODEL_EXPECTED_SIZE = 2800 * 1024 * 1024;
+const MIN_VALID_MODEL_BYTES = 100 * 1024 * 1024;
 
 export const EXPECTED_SHA256 = null;
 
@@ -201,6 +203,47 @@ export const ensureModelDir = async () => {
   }
 };
 
+const copyBundledAssetModelIfMissing = async () => {
+  if (Platform.OS !== 'android') return false;
+  if (typeof RNFS.copyFileAssets !== 'function') return false;
+
+  try {
+    await ensureModelDir();
+
+    const modelAlreadyPresent = await RNFS.exists(MODEL_PATH);
+    if (modelAlreadyPresent) return true;
+
+    const bundledTempPath = `${MODEL_PATH}.asset-tmp`;
+    const tmpExists = await RNFS.exists(bundledTempPath);
+    if (tmpExists) {
+      await RNFS.unlink(bundledTempPath);
+    }
+
+    await RNFS.copyFileAssets(BUNDLED_ASSET_MODEL_PATH, bundledTempPath);
+    const stat = await RNFS.stat(bundledTempPath);
+    const bytes = parseInt(stat.size, 10);
+
+    if (bytes < MIN_VALID_MODEL_BYTES) {
+      await RNFS.unlink(bundledTempPath);
+      throw new Error(`Bundled model too small (${bytes} bytes)`);
+    }
+
+    await RNFS.moveFile(bundledTempPath, MODEL_PATH);
+    await saveModelMeta({
+      hash: null,
+      size: bytes,
+      completed: true,
+      source: 'apk_assets',
+      timestamp: Date.now(),
+    });
+    console.log('Copied bundled GGUF model from APK assets to app storage');
+    return true;
+  } catch (e) {
+    console.warn('Bundled model copy skipped/failed:', e.message);
+    return false;
+  }
+};
+
 export const getModelSize = async () => {
   try {
     const exists = await RNFS.exists(MODEL_PATH);
@@ -294,16 +337,24 @@ export const checkAndResumeDownload = async () => {
 
 export const modelExists = async () => {
   try {
+    await copyBundledAssetModelIfMissing();
+
     const exists = await RNFS.exists(MODEL_PATH);
     if (!exists) return false;
     const stat = await RNFS.stat(MODEL_PATH);
     const bytes = parseInt(stat.size, 10);
-    if (bytes < MIN_SIZE_BYTES * 0.9) return false;
+    if (bytes < MIN_VALID_MODEL_BYTES) return false;
 
     const meta = await getModelMeta();
-    if (!meta || meta.version !== MODEL_VERSION) {
-      console.warn('Model version mismatch or missing metadata, invalidating');
-      return false;
+    if (!meta || meta.version !== MODEL_VERSION || !meta.completed) {
+      await saveModelMeta({
+        hash: null,
+        size: bytes,
+        completed: true,
+        source: 'runtime_check',
+        timestamp: Date.now(),
+      });
+      return true;
     }
 
     const checksumResult = await validateModelChecksum({ quick: true });
@@ -322,8 +373,12 @@ export const validateModelChecksum = async (options = {}) => {
 
     const stat = await RNFS.stat(filePath);
     const bytes = parseInt(stat.size, 10);
-    if (bytes < MIN_SIZE_BYTES) {
+    if (bytes < MIN_VALID_MODEL_BYTES) {
       return { valid: false, reason: `File too small: ${bytes} bytes` };
+    }
+
+    if (quick && !EXPECTED_SHA256) {
+      return { valid: true, reason: 'Quick validation passed (size only)' };
     }
 
     const meta = await getModelMeta();

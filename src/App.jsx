@@ -147,7 +147,11 @@ export default function App() {
         <AIProvider>
           <NavigationContainer>
             <StatusBar barStyle="light-content" backgroundColor="#0a0f1e" />
-            <Stack.Navigator screenOptions={{ headerShown: false }}>
+            <Stack.Navigator
+              key={hasCompletedOnboarding ? 'post-onboarding' : 'onboarding'}
+              initialRouteName={hasCompletedOnboarding ? 'Splash' : 'Onboarding'}
+              screenOptions={{ headerShown: false }}
+            >
               {!hasCompletedOnboarding ? (
                 <Stack.Screen name="Onboarding">
                   {(props) => (

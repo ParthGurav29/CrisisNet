@@ -1,5 +1,5 @@
 import React, { useEffect, useState, useContext } from 'react';
-import { View, Text, StyleSheet, ActivityIndicator, PressState } from 'react-native';
+import { View, Text, StyleSheet, ActivityIndicator } from 'react-native';
 import { Bar } from 'react-native-progress';
 import { AIContext } from '../context/AIContext';
 import { modelExists } from '../utils/modelStorage';
@@ -12,29 +12,58 @@ export default function SplashScreen({ navigation }) {
   const { loadModel } = useContext(AIContext);
 
   useEffect(() => {
+    let isMounted = true;
+    const startedAt = Date.now();
+    const MIN_SPLASH_MS = 1000;
+
+    const navigateWithMinimumSplash = async (routeName) => {
+      const elapsed = Date.now() - startedAt;
+      const remaining = Math.max(0, MIN_SPLASH_MS - elapsed);
+      if (remaining > 0) {
+        await new Promise(resolve => setTimeout(resolve, remaining));
+      }
+      if (isMounted) {
+        navigation.replace(routeName);
+      }
+    };
+
     const checkModel = async () => {
       try {
+        setProgress({ stage: 'Checking model file', percent: 10 });
         const exists = await modelExists();
         if (exists) {
-          loadModel((progress) => setProgress(progress));
-          const checkLoaded = setInterval(() => {
-            if (progress?.percent >= 100) {
-              clearInterval(checkLoaded);
-              navigation.replace('Home');
+          const result = await loadModel((nextProgress) => {
+            if (isMounted) {
+              setProgress(nextProgress);
             }
-          }, 500);
+          });
+          if (result?.success) {
+            await navigateWithMinimumSplash('Home');
+          } else {
+            setError(result?.error || 'Failed to load model');
+            await navigateWithMinimumSplash('ModelDownload');
+          }
         } else {
-          navigation.replace('ModelDownload');
+          setProgress({ stage: 'Model missing', percent: 0 });
+          await navigateWithMinimumSplash('ModelDownload');
         }
       } catch (e) {
         console.error('Error checking model:', e);
-        setError('Failed to check model status');
-        navigation.replace('ModelDownload');
+        if (isMounted) {
+          setError('Failed to check model status');
+        }
+        await navigateWithMinimumSplash('ModelDownload');
       } finally {
-        setChecking(false);
+        if (isMounted) {
+          setChecking(false);
+        }
       }
     };
     checkModel();
+
+    return () => {
+      isMounted = false;
+    };
   }, [navigation, loadModel]);
 
   const progressValue = progress.percent || 0;
