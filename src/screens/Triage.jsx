@@ -1,7 +1,6 @@
 import React, { useState, useContext } from 'react';
-import { View, Text, StyleSheet, ScrollView, TouchableOpacity, TextInput, ActivityIndicator, Alert } from 'react-native';
+import { View, Text, StyleSheet, ScrollView, TouchableOpacity, TextInput, ActivityIndicator } from 'react-native';
 import { AIContext } from '../context/AIContext';
-import { MeshContext } from '../context/MeshContext';
 
 const TRIAGE_TAGS = [
   { tag: 'RED', label: 'Immediate', desc: 'Life threatening · Medic needed NOW', color: '#ff2244' },
@@ -12,7 +11,6 @@ const TRIAGE_TAGS = [
 
 export default function TriageScreen() {
   const { isModelLoaded, isGenerating, generateTriage } = useContext(AIContext);
-  const { sendEmergency } = useContext(MeshContext);
   const [breathing, setBreathing] = useState(false);
   const [severeBleeding, setSevereBleeding] = useState(false);
   const [conscious, setConscious] = useState(false);
@@ -35,15 +33,6 @@ export default function TriageScreen() {
     } catch (e) {
       Alert.alert('Error', e.message);
     }
-  };
-
-  const handleBroadcast = () => {
-    if (!result) return;
-    sendEmergency({
-      desc: `Triage: ${result.tag} - ${result.reason}`,
-      color: result.tag,
-    });
-    Alert.alert('Broadcast', 'Triage packet sent via mesh network');
   };
 
   const ToggleButton = ({ label, value, onPress }) => (
@@ -112,9 +101,6 @@ export default function TriageScreen() {
                 </View>
                 <Text style={styles.resultReason}>{result.reason}</Text>
               </View>
-              <TouchableOpacity style={styles.broadcastResultBtn} onPress={handleBroadcast}>
-                <Text style={styles.broadcastResultBtnText}>Broadcast Result</Text>
-              </TouchableOpacity>
             </View>
           )}
         </View>
@@ -245,16 +231,5 @@ const styles = StyleSheet.create({
     color: '#e0e8ff',
     fontSize: 14,
     flex: 1,
-  },
-  broadcastResultBtn: {
-    backgroundColor: '#ff3b5c',
-    borderRadius: 8,
-    paddingVertical: 10,
-    alignItems: 'center',
-  },
-  broadcastResultBtnText: {
-    color: '#ffffff',
-    fontWeight: '700',
-    fontSize: 12,
   },
 });

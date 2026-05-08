@@ -1,5 +1,5 @@
 import RNFS from 'react-native-fs';
-import { getModelPath } from '../utils/modelStorage';
+import { getModelPath, setModelLifecycleState, MODEL_LIFECYCLE_STATES } from '../utils/modelStorage';
 import { getEmergencyResponse } from './offlineResponses';
 import { AppState } from 'react-native';
 
@@ -9,6 +9,9 @@ let isUsingFallback = false;
 let initError = null;
 let appStateListener = null;
 let unloadRequested = false;
+const DEFAULT_MAX_TOKENS = 96;
+const MIN_MAX_TOKENS = 24;
+const MAX_MAX_TOKENS = 192;
 
 export const AIState = {
   IDLE: 'idle',
@@ -46,10 +49,12 @@ const getOptimalThreadCount = () => {
     const totalMemory = DeviceInfo.getTotalMemory ? DeviceInfo.getTotalMemory() : 4000000000;
     const totalGB = totalMemory / (1024 * 1024 * 1024);
     
-    if (totalGB >= 8 && cores >= 6) {
-      return Math.min(4, cores);
-    } else if (totalGB >= 6 && cores >= 4) {
-      return Math.min(3, cores);
+    if (totalGB >= 8 && cores >= 8) {
+      return Math.min(6, Math.max(2, cores - 1));
+    } else if (totalGB >= 6 && cores >= 6) {
+      return Math.min(4, Math.max(2, cores - 1));
+    } else if (totalGB >= 4 && cores >= 4) {
+      return Math.min(3, Math.max(1, cores - 1));
     }
     return Math.min(2, Math.max(1, cores - 1));
   } catch (e) {
@@ -77,11 +82,16 @@ const ensureJsiReady = async () => {
   }
 };
 
+const MODEL_LOAD_TIMEOUT_MS = 5 * 60 * 1000;
+
 export const loadModel = async (onProgress) => {
   if (context) return { success: true };
   if (isInitializing) return { success: false, error: 'Already initializing' };
   isInitializing = true;
   initError = null;
+  await setModelLifecycleState(MODEL_LIFECYCLE_STATES.LOADING);
+
+  let progressInterval = null;
 
   const safeProgress = (data) => {
     try {
@@ -100,6 +110,7 @@ export const loadModel = async (onProgress) => {
     if (!isLlamaAvailable()) {
       console.warn('llama.rn not available - switching to fallback mode');
       isUsingFallback = true;
+      await setModelLifecycleState(MODEL_LIFECYCLE_STATES.FAILED, { reason: 'llama_runtime_unavailable' });
       safeProgress({ stage: 'Using offline mode', percent: 100 });
       isInitializing = false;
       return { success: true, fallback: true };
@@ -114,6 +125,7 @@ export const loadModel = async (onProgress) => {
       safeProgress({ stage: 'Model not found', percent: 0 });
       isInitializing = false;
       isUsingFallback = true;
+      await setModelLifecycleState(MODEL_LIFECYCLE_STATES.NOT_DOWNLOADED);
       return { success: true, fallback: true };
     }
 
@@ -130,6 +142,7 @@ export const loadModel = async (onProgress) => {
       }
       isInitializing = false;
       isUsingFallback = true;
+      await setModelLifecycleState(MODEL_LIFECYCLE_STATES.NOT_DOWNLOADED);
       return { success: true, fallback: true };
     }
 
@@ -146,17 +159,29 @@ export const loadModel = async (onProgress) => {
 
     const config = {
       model: MODEL_PATH,
-      n_ctx: 512,
+      n_ctx: 384,
+      n_batch: 256,
       n_threads,
       n_gpu_layers: 0,
       use_mmap: true,
       use_mlock: false,
-      seed: -1, // Random seed (default)
+      seed: -1,
     };
 
     console.log('[LLAMA] Calling init with config:', JSON.stringify({ ...config, model: 'REDACTED' }));
     
-    context = await initLlama(config);
+    progressInterval = setInterval(() => {
+      safeProgress({ stage: 'Loading model...', percent: 40 + Math.random() * 40 });
+    }, 800);
+
+    const loadPromise = initLlama(config);
+    const timeoutPromise = new Promise((_, reject) => {
+      setTimeout(() => reject(new Error('Model load timed out')), MODEL_LOAD_TIMEOUT_MS);
+    });
+    
+    context = await Promise.race([loadPromise, timeoutPromise]);
+    clearInterval(progressInterval);
+    progressInterval = null;
 
     if (!context) {
       throw new Error('initLlama returned null');
@@ -164,40 +189,65 @@ export const loadModel = async (onProgress) => {
 
     setupMemoryPressureHandler();
 
-    safeProgress({ stage: 'Warming up', percent: 90 });
+    safeProgress({ stage: 'Warming up model', percent: 85 });
 
     try {
-      const testResult = await generateResponse('hello', 20);
-      console.log('Test inference result:', testResult);
+      const warmupPromise = generateResponse('hello', 8);
+      const warmupTimeoutPromise = new Promise((_, reject) => {
+        setTimeout(() => reject(new Error('Warmup timed out')), 30000);
+      });
+      await Promise.race([warmupPromise, warmupTimeoutPromise]);
+      safeProgress({ stage: 'Optimizing', percent: 95 });
     } catch (testErr) {
       console.warn('Warmup inference failed:', testErr.message);
     }
 
     safeProgress({ stage: 'AI Ready', percent: 100 });
     isInitializing = false;
+    await setModelLifecycleState(MODEL_LIFECYCLE_STATES.READY_IN_RAM);
     console.log('AI model loaded successfully!');
     return { success: true };
   } catch (error) {
     console.error('Model load failed with error:', error);
+    if (progressInterval) clearInterval(progressInterval);
     initError = error;
 
     context = null;
     isInitializing = false;
     isUsingFallback = true;
+    await setModelLifecycleState(MODEL_LIFECYCLE_STATES.FAILED, { reason: error.message });
 
     return { success: false, error: error.message };
   }
 };
 
-export const generateResponse = async (prompt, maxTokens = 150) => {
+const isImageInput = (prompt) => {
+  if (typeof prompt !== 'string') return false;
+  const imagePatterns = [
+    /\.(png|jpg|jpeg|gif|bmp|webp|svg)$/i,
+    /^image:/i,
+    /image\/\w+/i,
+  ];
+  return imagePatterns.some(pattern => pattern.test(prompt));
+};
+
+export const generateResponse = async (prompt, maxTokens = DEFAULT_MAX_TOKENS) => {
+  if (isImageInput(prompt)) {
+    return 'This model does not support image input. Please provide a text-based question or description.';
+  }
+
   if (context && !isUsingFallback) {
     try {
       if (typeof context.completion !== 'function') {
         throw new Error('Context completion method not available');
       }
+      const safeMaxTokens = Math.max(
+        MIN_MAX_TOKENS,
+        Math.min(Number.isFinite(maxTokens) ? maxTokens : DEFAULT_MAX_TOKENS, MAX_MAX_TOKENS)
+      );
       const res = await context.completion({
         prompt,
-        n_predict: maxTokens,
+        n_predict: safeMaxTokens,
         temperature: 0.1,
       });
 
@@ -207,7 +257,7 @@ export const generateResponse = async (prompt, maxTokens = 150) => {
       if (e.message && (e.message.includes('OOM') || e.message.includes('memory') || e.message.includes('alloc'))) {
         console.warn('Out of memory detected, unloading model');
         unloadModel();
-        return { error: 'Model unloaded due to memory pressure', retry: true };
+        return 'Error: Model unloaded due to memory pressure. Please restart the app and try again.';
       }
       return getEmergencyResponse(prompt);
     }
@@ -221,4 +271,5 @@ export const unloadModel = () => {
   context = null;
   isUsingFallback = false;
   initError = null;
+  setModelLifecycleState(MODEL_LIFECYCLE_STATES.READY_ON_DISK).catch(() => {});
 };

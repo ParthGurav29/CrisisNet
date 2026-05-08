@@ -1,9 +1,17 @@
 import React, { useState, useEffect, useRef } from 'react';
-import { View, Text, StyleSheet, TouchableOpacity } from 'react-native';
+import { View, Text, StyleSheet, TouchableOpacity, Dimensions } from 'react-native';
 import { Bar } from 'react-native-progress';
 import { downloadModel, modelExists, MODEL_EXPECTED_SIZE } from '../utils/modelStorage';
 
 const MIN_SIZE_MB = Math.round(MODEL_EXPECTED_SIZE / (1024 * 1024));
+const MIN_SIZE_GB = (MODEL_EXPECTED_SIZE / (1024 * 1024 * 1024)).toFixed(1);
+const RECOMMENDED_FREE_GB = ((MODEL_EXPECTED_SIZE * 2) / (1024 * 1024 * 1024)).toFixed(1);
+const SCREEN_WIDTH = Dimensions.get('window').width;
+const BAR_WIDTH = Math.min(SCREEN_WIDTH - 60, 340);
+
+const SPEED_EMA_ALPHA = 0.3;
+const SPEED_CALC_INTERVAL_MS = 800;
+const STALL_THRESHOLD_MS = 15000;
 
 export default function ModelDownloadScreen({ navigation }) {
   const [progress, setProgress] = useState(0);
@@ -16,25 +24,38 @@ export default function ModelDownloadScreen({ navigation }) {
   const [etaMinutes, setEtaMinutes] = useState(0);
   const [etaSeconds, setEtaSeconds] = useState(0);
   const [stallDetected, setStallDetected] = useState(false);
+  const [currentAttempt, setCurrentAttempt] = useState(0);
 
   const lastBytesRef = useRef(0);
   const lastTimeRef = useRef(null);
+  const emaSpeedRef = useRef(0);
   const stallTimeoutRef = useRef(null);
+  const cancelControllerRef = useRef(null);
+  const isMountedRef = useRef(true);
 
   useEffect(() => {
+    isMountedRef.current = true;
     const checkExisting = async () => {
       try {
         const exists = await modelExists();
-        if (exists) {
-          navigation.replace('Home');
+        if (exists && isMountedRef.current) {
+          navigation.replace('Splash');
         }
       } catch (e) {
         console.error('Error checking model:', e);
       }
     };
     checkExisting();
+    
+    return () => {
+      isMountedRef.current = false;
+    };
   }, []);
 
+  /**
+   * Calculate download speed using raw bytes (not rounded MB) and smooth
+   * with an exponential moving average so the displayed speed doesn't jitter.
+   */
   const calculateSpeed = (bytesDownloaded) => {
     const now = Date.now();
     if (!lastTimeRef.current) {
@@ -42,13 +63,33 @@ export default function ModelDownloadScreen({ navigation }) {
       lastBytesRef.current = bytesDownloaded;
       return 0;
     }
-    const timeDiff = (now - lastTimeRef.current) / 1000;
-    if (timeDiff < 0.1) return speed;
+    const timeDiffMs = now - lastTimeRef.current;
+    // Only recalculate if enough time has passed to avoid division-by-tiny-number jitter
+    if (timeDiffMs < SPEED_CALC_INTERVAL_MS) {
+      return emaSpeedRef.current;
+    }
+    const timeDiffSec = timeDiffMs / 1000;
     const bytesDiff = bytesDownloaded - lastBytesRef.current;
-    const mbPerSecond = bytesDiff / (1024 * 1024) / timeDiff;
+    if (bytesDiff <= 0) return emaSpeedRef.current;
+
+    const instantMBps = bytesDiff / (1024 * 1024) / timeDiffSec;
+    // EMA smoothing
+    const smoothed = emaSpeedRef.current > 0
+      ? SPEED_EMA_ALPHA * instantMBps + (1 - SPEED_EMA_ALPHA) * emaSpeedRef.current
+      : instantMBps;
+    emaSpeedRef.current = smoothed;
+
     lastTimeRef.current = now;
     lastBytesRef.current = bytesDownloaded;
-    return mbPerSecond;
+    return smoothed;
+  };
+
+  const resetStallTimer = (percentDone) => {
+    if (stallTimeoutRef.current) clearTimeout(stallTimeoutRef.current);
+    setStallDetected(false);
+    stallTimeoutRef.current = setTimeout(() => {
+      if (percentDone < 1) setStallDetected(true);
+    }, STALL_THRESHOLD_MS);
   };
 
   const handleDownload = async () => {
@@ -56,47 +97,63 @@ export default function ModelDownloadScreen({ navigation }) {
     setError(null);
     setProgress(0);
     setDownloadedMB(0);
-    setStatus('downloading');
+    setTotalMB(MIN_SIZE_MB);
+    setStatus('ready');
     setSpeed(0);
     setStallDetected(false);
+    setCurrentAttempt(0);
     lastBytesRef.current = 0;
     lastTimeRef.current = null;
+    emaSpeedRef.current = 0;
 
-    if (stallTimeoutRef.current) clearTimeout(stallTimeoutRef.current);
-    stallTimeoutRef.current = setTimeout(() => {
-      setStallDetected(true);
-    }, 10000);
+    resetStallTimer(0);
+
+    cancelControllerRef.current = {};
+    const onCancel = (cancelFn) => {
+      cancelControllerRef.current.cancel = cancelFn;
+    };
 
     const onProgress = (data) => {
-      const percent = data.percentage / 100;
-      setProgress(percent);
-      setDownloadedMB(data.downloaded);
-      setTotalMB(data.total);
+      if (data?.stage === 'verifying') {
+        setStatus('verifying');
+      } else if (data?.stage === 'retrying') {
+        setStatus('retrying');
+      } else {
+        setStatus('downloading');
+      }
 
-      const newSpeed = calculateSpeed(data.downloaded * 1024 * 1024);
+      const percent = Math.min(1, data.percentage / 100);
+      setProgress(percent);
+      setDownloadedMB(data.downloaded || 0);
+      setTotalMB(data.total || MIN_SIZE_MB);
+      if (data.attempt) setCurrentAttempt(data.attempt);
+
+      if (data.error) {
+        setError(data.error);
+      }
+
+      const rawBytes = data.bytesWritten ?? 0;
+      const newSpeed = calculateSpeed(rawBytes);
       setSpeed(newSpeed);
 
-      if (newSpeed > 0) {
-        setStallDetected(false);
-        if (stallTimeoutRef.current) clearTimeout(stallTimeoutRef.current);
+      if (newSpeed > 0.01 && data.total > 0) {
         const remainingMB = data.total - data.downloaded;
         const etaSec = remainingMB / newSpeed;
         setEtaMinutes(Math.floor(etaSec / 60));
         setEtaSeconds(Math.floor(etaSec % 60));
       }
 
-      if (stallTimeoutRef.current) clearTimeout(stallTimeoutRef.current);
-      stallTimeoutRef.current = setTimeout(() => {
-        if (percent < 1) setStallDetected(true);
-      }, 10000);
+      resetStallTimer(percent);
     };
 
     try {
-      setStatus('verifying');
-      const result = await downloadModel(onProgress);
+      const result = await downloadModel(onProgress, onCancel);
       if (result === true) {
         setStatus('complete');
-        setTimeout(() => navigation.replace('Home'), 500);
+        setProgress(1);
+        setTimeout(() => {
+          if (isMountedRef.current) navigation.replace('Splash');
+        }, 500);
       } else {
         throw new Error(result?.error || 'Download failed');
       }
@@ -108,6 +165,18 @@ export default function ModelDownloadScreen({ navigation }) {
       if (stallTimeoutRef.current) clearTimeout(stallTimeoutRef.current);
     }
   };
+
+  const progressPercent = Math.min(100, Math.round(progress * 100));
+
+  const formatBytes = (bytes) => {
+    if (bytes >= 1024 * 1024 * 1024) {
+      return `${(bytes / (1024 * 1024 * 1024)).toFixed(1)} GB`;
+    }
+    return `${Math.round(bytes / (1024 * 1024))} MB`;
+  };
+
+  const displayDownloaded = formatBytes(downloadedMB * 1024 * 1024);
+  const displayTotal = formatBytes(totalMB * 1024 * 1024);
 
   return (
     <View style={styles.container}>
@@ -121,23 +190,25 @@ export default function ModelDownloadScreen({ navigation }) {
         <View style={styles.warningBox}>
           <Text style={styles.warningTitle}>⚠️ Large Download</Text>
           <Text style={styles.warningText}>
-            ~{MIN_SIZE_MB} GB file — WiFi strongly recommended
+            ~{MIN_SIZE_GB} GB model • Keep at least {RECOMMENDED_FREE_GB} GB free • WiFi recommended
           </Text>
         </View>
 
         <View style={styles.progressContainer}>
           <Bar
             progress={progress}
-            width={200}
-            height={12}
+            width={BAR_WIDTH}
+            height={14}
             color="#4d9fff"
             unfilledColor="#1a2540"
-            borderColor="#4d9fff"
+            borderColor="#2a3a5f"
+            borderRadius={7}
+            animated={false}
           />
           <Text style={styles.progressText}>
-            {Math.round(progress * 100)}% • {downloadedMB} MB / {totalMB} MB
+            {progressPercent}% • {displayDownloaded} / {displayTotal}
           </Text>
-          {speed > 0 && (
+          {speed > 0.01 && (
             <Text style={styles.speedText}>
               {speed.toFixed(1)} MB/s • ~{etaMinutes}m {etaSeconds}s left
             </Text>
@@ -148,10 +219,12 @@ export default function ModelDownloadScreen({ navigation }) {
             </Text>
           )}
           <Text style={styles.statusText}>
-            {status === 'downloading' && 'Downloading...'}
-            {status === 'verifying' && 'Verifying...'}
-            {status === 'complete' && 'Complete!'}
+            {status === 'downloading' && `Downloading${currentAttempt > 1 ? ` (attempt ${currentAttempt})` : ''}...`}
+            {status === 'retrying' && `Retrying${currentAttempt > 1 ? ` (attempt ${currentAttempt})` : ''}...`}
+            {status === 'verifying' && 'Verifying model integrity...'}
+            {status === 'complete' && 'Download complete!'}
             {status === 'error' && 'Error occurred'}
+            {status === 'ready' && 'Ready to download'}
           </Text>
         </View>
 
@@ -166,7 +239,11 @@ export default function ModelDownloadScreen({ navigation }) {
 
         {error ? (
           <View style={styles.errorContainer}>
-            <Text style={styles.errorText}>{error}</Text>
+            <Text style={styles.errorText}>
+              {error.includes('resolve host') || error.includes('No address') || error.includes('Unable to resolve host')
+                ? 'Network error: Cannot reach HuggingFace. Check your internet connection.'
+                : error}
+            </Text>
             <TouchableOpacity style={styles.retryBtn} onPress={handleDownload}>
               <Text style={styles.retryBtnText}>RETRY</Text>
             </TouchableOpacity>
@@ -234,8 +311,9 @@ const styles = StyleSheet.create({
   },
   progressText: {
     color: '#8899bb',
-    fontSize: 12,
-    marginTop: 8,
+    fontSize: 13,
+    marginTop: 10,
+    fontWeight: '500',
   },
   speedText: {
     color: '#4dff88',

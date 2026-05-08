@@ -13,12 +13,11 @@ export const saveMessage = async (message, retryCount = 0) => {
         'INSERT INTO messages (id, sender, text, timestamp, type, color, triage) VALUES (?, ?, ?, ?, ?, ?, ?) ON CONFLICT(id) DO NOTHING',
         [message.id, message.sender, message.text, message.timestamp, message.type, message.color || null, message.triage || null],
         () => resolve(message),
-        (tx, error) => {
+        async (tx, error) => {
           console.error('saveMessage error:', error);
           if (retryCount < MAX_RETRIES) {
-            sleep(RETRY_DELAY_MS).then(() => {
-              saveMessage(message, retryCount + 1).then(resolve).catch(reject);
-            });
+            await sleep(RETRY_DELAY_MS);
+            saveMessage(message, retryCount + 1).then(resolve).catch(reject);
           } else {
             reject(error);
           }
@@ -38,12 +37,11 @@ export const getMessages = async (retryCount = 0) => {
           messages.push(results.rows.item(i));
         }
         resolve(messages);
-      }, (tx, error) => {
+      }, async (tx, error) => {
         console.error('getMessages error:', error);
         if (retryCount < MAX_RETRIES) {
-          sleep(RETRY_DELAY_MS).then(() => {
-            getMessages(retryCount + 1).then(resolve).catch(reject);
-          });
+          await sleep(RETRY_DELAY_MS);
+          getMessages(retryCount + 1).then(resolve).catch(reject);
         } else {
           reject(error);
         }

@@ -36,23 +36,28 @@ const createSha256Hasher = () => {
   };
 };
 
-const HF_TOKEN = 'ur hf token ';
+const HF_TOKEN = 'ur token';
 
 
 export const MODEL_FILENAME = 'gemma-4-E2B-it-Q4_K_M.gguf';
-const MODEL_PATH = `${RNFS.DocumentDirectoryPath}/models/${MODEL_FILENAME}`;
-const MODEL_DIR = `${RNFS.DocumentDirectoryPath}/models`;
-const TEMP_MODEL_PATH = `${RNFS.DocumentDirectoryPath}/models/${MODEL_FILENAME}.tmp`;
-const BUNDLED_ASSET_MODEL_PATH = 'models/gemma.gguf';
-const LOCK_PATH = `${RNFS.DocumentDirectoryPath}/models/download.lock`;
+export const MODEL_ID = 'gemma';
+const MODEL_ROOT_DIR = `${RNFS.DocumentDirectoryPath}/models`;
+const MODEL_DIR = `${MODEL_ROOT_DIR}/${MODEL_ID}`;
+const MODEL_PATH = `${MODEL_DIR}/${MODEL_FILENAME}`;
+const TEMP_MODEL_PATH = `${MODEL_DIR}/${MODEL_FILENAME}.tmp`;
+const LOCK_PATH = `${MODEL_DIR}/download.lock`;
+const LEGACY_MODEL_PATH = `${MODEL_ROOT_DIR}/${MODEL_FILENAME}`;
+const LEGACY_LOCK_PATH = `${MODEL_ROOT_DIR}/download.lock`;
+const LEGACY_META_PATH = `${MODEL_ROOT_DIR}/meta.json`;
 const DOWNLOAD_STATE_KEY = 'download_state';
 const ACK_DEDUPE_KEY = 'ack_dedupe';
 const SYSTEM_STATE_KEY = 'system_state';
 const RETRY_BUDGET_KEY = 'retry_budget';
+const MODEL_LIFECYCLE_KEY = 'model_lifecycle_state';
 const MODEL_URL =
   'https://huggingface.co/unsloth/gemma-4-E2B-it-GGUF/resolve/main/gemma-4-E2B-it-Q4_K_M.gguf';
-const MODEL_EXPECTED_SIZE = 2800 * 1024 * 1024;
-const MIN_VALID_MODEL_BYTES = 100 * 1024 * 1024;
+export const MODEL_EXPECTED_SIZE = 2800 * 1024 * 1024;
+const MIN_VALID_MODEL_BYTES = MODEL_EXPECTED_SIZE * 0.5;
 
 export const EXPECTED_SHA256 = null;
 
@@ -71,17 +76,34 @@ export const computeModelChecksum = async (filePath) => {
     });
     hash.update(chunk);
     offset += lengthToRead;
+    await new Promise(resolve => setTimeout(resolve, 0));
   }
   return hash.digest('hex');
+};
+
+const verifyGgufHeader = async (filePath) => {
+  try {
+    if (typeof RNFS.read !== 'function') {
+      return { valid: true };
+    }
+    const magic = await RNFS.read(filePath, 4, 0, 'ascii');
+    if (magic !== 'GGUF') {
+      return { valid: false, reason: `Invalid GGUF header: ${magic || 'unknown'}` };
+    }
+    return { valid: true };
+  } catch (e) {
+    return { valid: false, reason: `Failed to read GGUF header: ${e.message}` };
+  }
 };
 
 const MIN_RAM_GB = 5;
 const MIN_RAM_BYTES = MIN_RAM_GB * 1024 * 1024 * 1024;
 const MIN_SIZE_BYTES = MODEL_EXPECTED_SIZE;
 export const MIN_SIZE_MB = Math.round(MIN_SIZE_BYTES / (1024 * 1024));
-const DOWNLOAD_TIMEOUT_MS = 300000;
+const DOWNLOAD_INACTIVITY_TIMEOUT_MS = 5 * 60 * 1000;
+const DOWNLOAD_MONITOR_INTERVAL_MS = 1000;
 const MAX_RETRIES = 5;
-const RETRY_DELAY_MS = 5000;
+const RETRY_DELAY_MS = 3000;
 const STORAGE_SAFETY_MARGIN = 2.0;
 const MEMORY_SAFETY_MULTIPLIER = 1.8;
 const MAX_RESUME_ATTEMPTS = 3;
@@ -90,15 +112,29 @@ const ACK_DEDUPE_TTL_MS = 5 * 60 * 1000;
 const MAX_ACK_DEDUPE_ENTRIES = 1000;
 const MAX_RETRIES_PER_MINUTE = 20;
 const MEMORY_SAFETY_THRESHOLD = 0.3;
+const MODEL_QUANTIZATION = 'Q4_K_M';
+const MODEL_FORMAT = 'gguf';
+const MIN_RESUME_BYTES = 10 * 1024 * 1024;
 
 const NON_RETRYABLE_ERRORS = new Set([401, 403, 404]);
 
 const MODEL_VERSION = 1;
 const META_FILENAME = 'meta.json';
+const PARTIAL_DOWNLOAD_THRESHOLD = 10 * 1024 * 1024;
 
 let downloadCancellationPromise = null;
 let activeDownload = null;
 let modelInUse = false;
+
+export const MODEL_LIFECYCLE_STATES = Object.freeze({
+  NOT_DOWNLOADED: 'NOT_DOWNLOADED',
+  DOWNLOADING: 'DOWNLOADING',
+  VERIFYING: 'VERIFYING',
+  READY_ON_DISK: 'READY_ON_DISK',
+  LOADING: 'LOADING',
+  READY_IN_RAM: 'READY_IN_RAM',
+  FAILED: 'FAILED',
+});
 
 // Unique to *this* JS session. Written into the download lock so we can
 // detect orphan locks left behind by a previous app process / JS reload
@@ -106,11 +142,55 @@ let modelInUse = false;
 // session id is by definition stale and safe to steal).
 const SESSION_ID = `${Date.now().toString(36)}-${Math.random().toString(36).slice(2, 10)}`;
 
+export const getPartialDownloadInfo = async () => {
+  try {
+    if (!(await RNFS.exists(TEMP_MODEL_PATH))) return null;
+    const stat = await RNFS.stat(TEMP_MODEL_PATH);
+    const size = parseInt(stat.size, 10);
+    if (size < PARTIAL_DOWNLOAD_THRESHOLD) {
+      await RNFS.unlink(TEMP_MODEL_PATH);
+      return null;
+    }
+    return { bytesDownloaded: size, totalBytes: MODEL_EXPECTED_SIZE };
+  } catch (e) {
+    return null;
+  }
+};
+
 export const getModelVersion = () => MODEL_VERSION;
 
 export const getMetaPath = () => `${MODEL_DIR}/${META_FILENAME}`;
 
 export const getLockPath = () => LOCK_PATH;
+
+export const setModelLifecycleState = async (state, details = {}) => {
+  try {
+    await AsyncStorage.setItem(
+      MODEL_LIFECYCLE_KEY,
+      JSON.stringify({
+        state,
+        details,
+        timestamp: Date.now(),
+      }),
+    );
+  } catch (e) {
+    console.warn('Failed to persist model lifecycle state:', e.message);
+  }
+};
+
+export const getModelLifecycleState = async () => {
+  try {
+    const raw = await AsyncStorage.getItem(MODEL_LIFECYCLE_KEY);
+    const persisted = raw ? JSON.parse(raw) : null;
+    if (persisted?.state === MODEL_LIFECYCLE_STATES.DOWNLOADING || persisted?.state === MODEL_LIFECYCLE_STATES.VERIFYING || persisted?.state === MODEL_LIFECYCLE_STATES.LOADING) {
+      return persisted.state;
+    }
+  } catch (e) {
+    // ignore parse/read errors; fall through to disk detection
+  }
+  const exists = await RNFS.exists(MODEL_PATH);
+  return exists ? MODEL_LIFECYCLE_STATES.READY_ON_DISK : MODEL_LIFECYCLE_STATES.NOT_DOWNLOADED;
+};
 
 export const getModelMeta = async () => {
   try {
@@ -129,7 +209,19 @@ export const saveModelMeta = async (meta) => {
   try {
     const metaPath = getMetaPath();
     const tmpPath = `${metaPath}.tmp`;
-    const content = JSON.stringify({ ...meta, version: MODEL_VERSION, timestamp: Date.now() });
+    const content = JSON.stringify({
+      modelId: MODEL_ID,
+      filename: MODEL_FILENAME,
+      format: MODEL_FORMAT,
+      quantization: MODEL_QUANTIZATION,
+      compatibility: {
+        minRamGB: MIN_RAM_GB,
+        minStorageBytes: Math.round(MODEL_EXPECTED_SIZE * STORAGE_SAFETY_MARGIN),
+      },
+      version: MODEL_VERSION,
+      timestamp: Date.now(),
+      ...meta,
+    });
     await RNFS.writeFile(tmpPath, content, 'utf8');
     if (RNFS.fsync) await RNFS.fsync(tmpPath);
     await RNFS.moveFile(tmpPath, metaPath);
@@ -185,6 +277,7 @@ export const saveResumeOffset = async (bytesWritten, totalBytes) => {
 export const getModelPath = () => MODEL_PATH;
 
 export const getModelDir = () => MODEL_DIR;
+export const getModelRootDir = () => MODEL_ROOT_DIR;
 
 // Ensure `${DocumentDirectory}/models/` exists. Idempotent and safe to call
 // many times. The first launch of the app does not have this directory yet,
@@ -192,10 +285,15 @@ export const getModelDir = () => MODEL_DIR;
 // `downloadModel` to incorrectly surface "Download already in progress".
 export const ensureModelDir = async () => {
   try {
+    const rootExists = await RNFS.exists(MODEL_ROOT_DIR);
+    if (!rootExists) {
+      await RNFS.mkdir(MODEL_ROOT_DIR);
+    }
     const exists = await RNFS.exists(MODEL_DIR);
     if (!exists) {
       await RNFS.mkdir(MODEL_DIR);
     }
+    await migrateLegacyRuntimeLayout();
     return true;
   } catch (e) {
     console.warn('Failed to ensure model dir:', e.message);
@@ -203,44 +301,35 @@ export const ensureModelDir = async () => {
   }
 };
 
-const copyBundledAssetModelIfMissing = async () => {
-  if (Platform.OS !== 'android') return false;
-  if (typeof RNFS.copyFileAssets !== 'function') return false;
+const migrateLegacyRuntimeLayout = async () => {
+  try {
+    const legacyModelExists = await RNFS.exists(LEGACY_MODEL_PATH);
+    const currentModelExists = await RNFS.exists(MODEL_PATH);
+    if (legacyModelExists && !currentModelExists) {
+      await RNFS.moveFile(LEGACY_MODEL_PATH, MODEL_PATH);
+      console.log('Migrated legacy runtime model into managed model directory');
+    }
+  } catch (e) {
+    console.warn('Failed to migrate legacy model path:', e.message);
+  }
 
   try {
-    await ensureModelDir();
-
-    const modelAlreadyPresent = await RNFS.exists(MODEL_PATH);
-    if (modelAlreadyPresent) return true;
-
-    const bundledTempPath = `${MODEL_PATH}.asset-tmp`;
-    const tmpExists = await RNFS.exists(bundledTempPath);
-    if (tmpExists) {
-      await RNFS.unlink(bundledTempPath);
+    const legacyMetaExists = await RNFS.exists(LEGACY_META_PATH);
+    const currentMetaExists = await RNFS.exists(getMetaPath());
+    if (legacyMetaExists && !currentMetaExists) {
+      await RNFS.moveFile(LEGACY_META_PATH, getMetaPath());
     }
-
-    await RNFS.copyFileAssets(BUNDLED_ASSET_MODEL_PATH, bundledTempPath);
-    const stat = await RNFS.stat(bundledTempPath);
-    const bytes = parseInt(stat.size, 10);
-
-    if (bytes < MIN_VALID_MODEL_BYTES) {
-      await RNFS.unlink(bundledTempPath);
-      throw new Error(`Bundled model too small (${bytes} bytes)`);
-    }
-
-    await RNFS.moveFile(bundledTempPath, MODEL_PATH);
-    await saveModelMeta({
-      hash: null,
-      size: bytes,
-      completed: true,
-      source: 'apk_assets',
-      timestamp: Date.now(),
-    });
-    console.log('Copied bundled GGUF model from APK assets to app storage');
-    return true;
   } catch (e) {
-    console.warn('Bundled model copy skipped/failed:', e.message);
-    return false;
+    console.warn('Failed to migrate legacy model metadata:', e.message);
+  }
+
+  try {
+    const legacyLockExists = await RNFS.exists(LEGACY_LOCK_PATH);
+    if (legacyLockExists) {
+      await RNFS.unlink(LEGACY_LOCK_PATH);
+    }
+  } catch (e) {
+    // ignore stale legacy lock cleanup failures
   }
 };
 
@@ -277,9 +366,10 @@ export const acquireDownloadLock = async () => {
     }
     const lockData = {
       sessionId: SESSION_ID,
-      pid: process.pid || Date.now(),
+      pid: typeof process !== 'undefined' && process.pid ? process.pid : Date.now(),
       timestamp: Date.now(),
       appStartTimestamp: Date.now(),
+      progress: { bytesWritten: 0, totalBytes: MODEL_EXPECTED_SIZE },
     };
     await writeLockFile(lockData);
     return { acquired: true, lock: lockData };
@@ -318,6 +408,36 @@ const isLockStale = (lock) => {
   return age > LOCK_TTL_MS;
 };
 
+export const updateLockProgress = async (bytesWritten, totalBytes) => {
+  try {
+    const lock = await readLockFile();
+    if (lock) {
+      lock.progress = { bytesWritten, totalBytes };
+      await writeLockFile(lock);
+    }
+  } catch (e) {
+    console.warn('Failed to update lock progress:', e.message);
+  }
+};
+
+const askResumeChoice = async (partialInfo) => {
+  try {
+    const { Alert } = require('react-native');
+    return new Promise((resolve) => {
+      Alert.alert(
+        'Resume Download',
+        `Found partial download: ${Math.round(partialInfo.bytesDownloaded / (1024 * 1024))} MB of ${Math.round(MODEL_EXPECTED_SIZE / (1024 * 1024))} MB. Resume or restart?`,
+        [
+          { text: 'Restart', onPress: () => resolve(false) },
+          { text: 'Resume', onPress: () => resolve(true) },
+        ]
+      );
+    });
+  } catch (e) {
+    return false;
+  }
+};
+
 export const isModelLocked = () => modelInUse;
 
 export const setModelInUse = (inUse) => {
@@ -337,13 +457,17 @@ export const checkAndResumeDownload = async () => {
 
 export const modelExists = async () => {
   try {
-    await copyBundledAssetModelIfMissing();
-
     const exists = await RNFS.exists(MODEL_PATH);
-    if (!exists) return false;
+    if (!exists) {
+      await setModelLifecycleState(MODEL_LIFECYCLE_STATES.NOT_DOWNLOADED);
+      return false;
+    }
     const stat = await RNFS.stat(MODEL_PATH);
     const bytes = parseInt(stat.size, 10);
-    if (bytes < MIN_VALID_MODEL_BYTES) return false;
+    if (bytes < MIN_VALID_MODEL_BYTES) {
+      await setModelLifecycleState(MODEL_LIFECYCLE_STATES.NOT_DOWNLOADED, { reason: 'file_too_small' });
+      return false;
+    }
 
     const meta = await getModelMeta();
     if (!meta || meta.version !== MODEL_VERSION || !meta.completed) {
@@ -354,13 +478,19 @@ export const modelExists = async () => {
         source: 'runtime_check',
         timestamp: Date.now(),
       });
+      await setModelLifecycleState(MODEL_LIFECYCLE_STATES.READY_ON_DISK);
       return true;
     }
 
     const checksumResult = await validateModelChecksum({ quick: true });
+    await setModelLifecycleState(
+      checksumResult.valid ? MODEL_LIFECYCLE_STATES.READY_ON_DISK : MODEL_LIFECYCLE_STATES.FAILED,
+      checksumResult.valid ? {} : { reason: checksumResult.reason || 'checksum_failed' },
+    );
     return checksumResult.valid;
   } catch (e) {
     console.error('Error checking model:', e);
+    await setModelLifecycleState(MODEL_LIFECYCLE_STATES.FAILED, { reason: e.message });
     return false;
   }
 };
@@ -377,8 +507,13 @@ export const validateModelChecksum = async (options = {}) => {
       return { valid: false, reason: `File too small: ${bytes} bytes` };
     }
 
+    const headerResult = await verifyGgufHeader(filePath);
+    if (!headerResult.valid) {
+      return headerResult;
+    }
+
     if (quick && !EXPECTED_SHA256) {
-      return { valid: true, reason: 'Quick validation passed (size only)' };
+      return { valid: true, reason: 'Quick validation passed (size + GGUF header)' };
     }
 
     const meta = await getModelMeta();
@@ -388,8 +523,8 @@ export const validateModelChecksum = async (options = {}) => {
       }
     }
 
-    const hash = createSha256Hasher();
     const chunkSize = 1024 * 1024;
+    const hash = createSha256Hasher();
 
     let offset = 0;
     while (offset < bytes) {
@@ -400,11 +535,12 @@ export const validateModelChecksum = async (options = {}) => {
       });
       hash.update(chunk);
       offset += lengthToRead;
-      if (offset % (chunkSize * 10) === 0) {
-        await new Promise(resolve => setTimeout(resolve, 1));
-      }
+      await new Promise(resolve => setTimeout(resolve, 0));
     }
     const computedHash = hash.digest('hex');
+    if (EXPECTED_SHA256 && computedHash.toLowerCase() !== EXPECTED_SHA256.toLowerCase()) {
+      return { valid: false, reason: 'Checksum mismatch', hash: computedHash };
+    }
 
     const partialHash = createSha256Hasher();
     const endBytes = Math.min(1024 * 1024, bytes);
@@ -469,7 +605,10 @@ export const getFreeDiskStorage = async () => {
 export const checkStoragePreDownload = async (modelSize = MODEL_EXPECTED_SIZE) => {
   const storage = await getAvailableStorage();
   if (!storage) {
-    throw new Error('Unable to determine available storage space.');
+    // Cannot determine storage — warn but do NOT block the download.
+    // On many devices/emulators getFSInfo() is unavailable.
+    console.warn('Unable to determine available storage space — proceeding anyway.');
+    return true;
   }
 
   const requiredBytes = modelSize * STORAGE_SAFETY_MARGIN;
@@ -674,16 +813,23 @@ export const getQueueDelay = (retryCount, networkQuality) => {
 
 export const downloadModel = async (onProgress, onCancel) => {
   await ensureModelDir();
+  await setModelLifecycleState(MODEL_LIFECYCLE_STATES.DOWNLOADING);
   const lock = await acquireDownloadLock();
   if (!lock.acquired) {
     if (lock.ioError) {
-      // Couldn't write the lock file itself (e.g. transient FS issue).
-      // Treat this as "no other download is running" and proceed without a
-      // lock rather than mis-reporting "already downloading" to the UI.
       console.warn('Proceeding without download lock due to I/O error:', lock.reason);
     } else {
       console.log('Download already in progress:', lock.reason);
       return { alreadyDownloading: true, lock: lock.lock };
+    }
+  }
+
+  const partialInfo = await getPartialDownloadInfo();
+  if (partialInfo) {
+    const resumeChoice = await askResumeChoice(partialInfo);
+    if (!resumeChoice) {
+      await clearDownloadState();
+      try { await RNFS.unlink(TEMP_MODEL_PATH); } catch (_) {}
     }
   }
 
@@ -697,8 +843,11 @@ export const downloadModel = async (onProgress, onCancel) => {
 
   activeDownload = (async () => {
     let downloadRef = null;
+    let inactivityMonitorId = null;
     let attempt = 0;
     let cancelled = false;
+    let lastProgressAt = Date.now();
+    let lastBytesWritten = 0;
 
     const cancellationController = new Promise((_, reject) => {
       onCancel?.(() => {
@@ -738,64 +887,101 @@ export const downloadModel = async (onProgress, onCancel) => {
             await RNFS.mkdir(MODEL_DIR);
           }
 
-          let resumeOffset = 0;
+          // RNFS.downloadFile always truncates the target file — it does NOT
+          // support HTTP Range resume.  Delete any leftover temp file so we
+          // get a clean HTTP 200 response and correct bytesWritten accounting.
           if (await RNFS.exists(TEMP_MODEL_PATH)) {
-            const stat = await RNFS.stat(TEMP_MODEL_PATH);
-            const existingSize = parseInt(stat.size, 10);
-            if (existingSize >= MIN_SIZE_BYTES * 0.9) {
-              resumeOffset = existingSize;
-            }
+            try { await RNFS.unlink(TEMP_MODEL_PATH); } catch (_) { /* ignore */ }
           }
+          lastBytesWritten = 0;
+          lastProgressAt = Date.now();
 
-          console.log('Starting download to temp file:', TEMP_MODEL_PATH, 'attempt:', attempt, 'offset:', resumeOffset);
+          console.log('Starting download to temp file:', TEMP_MODEL_PATH, 'attempt:', attempt);
+
+          // Track last percent we persisted so we only write to AsyncStorage
+          // every 5% (cheap), but fire onProgress on EVERY callback (smooth UI).
+          let lastPersistedPercent = -1;
 
           const options = {
             fromUrl: MODEL_URL,
             toFile: TEMP_MODEL_PATH,
-            progress: async (data) => {
+            progressInterval: 200,
+            progressDivider: 1,
+            progress: (data) => {
               if (cancelled) {
                 downloadRef?.cancel?.();
                 return;
               }
-              const percent = Math.round((data.bytesWritten / data.totalBytes) * 100);
-              if (percent % 5 === 0) {
-                await saveResumeOffset(data.bytesWritten, data.totalBytes);
+              if (data.bytesWritten > lastBytesWritten) {
+                lastBytesWritten = data.bytesWritten;
+                lastProgressAt = Date.now();
               }
+              const percent = data.totalBytes > 0
+                ? Math.round((data.bytesWritten / data.totalBytes) * 100)
+                : (data.bytesWritten > 0 ? 1 : 0);
+
+              // Persist resume state and update lock every 5%
+              if (percent >= lastPersistedPercent + 5) {
+                lastPersistedPercent = percent;
+                saveResumeOffset(data.bytesWritten, data.totalBytes).catch(() => {});
+                updateLockProgress(data.bytesWritten, data.totalBytes).catch(() => {});
+              }
+
+              // Fire progress on EVERY callback so the UI bar is smooth
               onProgress?.({
+                bytesWritten: data.bytesWritten,
+                totalBytes: data.totalBytes,
                 downloaded: Math.round(data.bytesWritten / (1024 * 1024)),
                 total: Math.round(data.totalBytes / (1024 * 1024)),
                 percentage: percent,
                 attempt,
-                resumed: resumeOffset > 0,
               });
-              await new Promise(resolve => setTimeout(resolve, 1));
             },
             headers: {
               'Authorization': HF_TOKEN ? `Bearer ${HF_TOKEN}` : undefined,
               'User-Agent': 'CrisisNet/1.0',
-              'Range': resumeOffset > 0 ? `bytes=${resumeOffset}-` : undefined,
             },
-            stopOnFailure: false,
+            connectionTimeout: 60000,
+            readTimeout: 120000,
             begin: (res) => {
-              console.log('Download response status:', res.statusCode);
+              console.log('Download response status:', res.statusCode, 'contentLength:', res.contentLength);
             },
           };
 
           downloadRef = RNFS.downloadFile(options);
+          const inactivityTimeoutPromise = new Promise((_, reject) => {
+            inactivityMonitorId = setInterval(() => {
+              if (cancelled) return;
+              const idleMs = Date.now() - lastProgressAt;
+              if (idleMs >= DOWNLOAD_INACTIVITY_TIMEOUT_MS) {
+                clearInterval(inactivityMonitorId);
+                inactivityMonitorId = null;
+                reject(new Error(`Download stalled for ${Math.round(idleMs / 1000)}s`));
+              }
+            }, DOWNLOAD_MONITOR_INTERVAL_MS);
+          });
 
-          const result = await Promise.race([
-            downloadRef.promise,
-            new Promise((_, reject) =>
-              setTimeout(() => reject(new Error('Download timeout')), DOWNLOAD_TIMEOUT_MS)
-            ),
-            cancellationController.then(() => {
-              throw new Error('Download cancelled');
-            }),
-          ]);
+          let result;
+          try {
+            result = await Promise.race([
+              downloadRef.promise,
+              inactivityTimeoutPromise,
+              cancellationController.then(() => {
+                throw new Error('Download cancelled');
+              }),
+            ]);
+          } finally {
+            if (inactivityMonitorId) {
+              clearInterval(inactivityMonitorId);
+              inactivityMonitorId = null;
+            }
+          }
           console.log('Download result:', result);
 
+          // 416 Range Not Satisfiable should not happen anymore since we
+          // no longer send Range headers, but handle it defensively.
           if (result.statusCode === 416) {
-            console.log('Server does not support range requests, starting fresh');
+            console.log('Got 416 — retrying without Range header');
           }
 
           if (result.statusCode === 401) {
@@ -813,6 +999,9 @@ export const downloadModel = async (onProgress, onCancel) => {
           if (result.statusCode && result.statusCode !== 200 && result.statusCode !== 206) {
             throw new Error(`Download failed with status: ${result.statusCode}`);
           }
+          if (!result.statusCode || result.statusCode === 0) {
+            throw new Error('Download failed: Unable to resolve host "huggingface.co"');
+          }
 
           const stat = await RNFS.stat(TEMP_MODEL_PATH);
           const downloadedSize = parseInt(stat.size, 10);
@@ -822,7 +1011,15 @@ export const downloadModel = async (onProgress, onCancel) => {
             throw new Error(`Download incomplete: ${Math.round(downloadedSize / (1024 * 1024))} MB < ${MIN_SIZE_MB} MB minimum`);
           }
 
-          const checksumResult = await validateModelChecksum({ path: TEMP_MODEL_PATH });
+          await setModelLifecycleState(MODEL_LIFECYCLE_STATES.VERIFYING);
+          onProgress?.({
+            downloaded: Math.round(downloadedSize / (1024 * 1024)),
+            total: Math.round(downloadedSize / (1024 * 1024)),
+            percentage: 100,
+            attempt,
+            stage: 'verifying',
+          });
+          const checksumResult = await validateModelChecksum({ path: TEMP_MODEL_PATH, quick: true });
           if (!checksumResult.valid) {
             await RNFS.unlink(TEMP_MODEL_PATH);
             throw new Error(`Model validation failed: ${checksumResult.reason}`);
@@ -832,11 +1029,9 @@ export const downloadModel = async (onProgress, onCancel) => {
             throw new Error('Model is currently in use, cannot replace');
           }
 
-          const testResult = await testModelLoad(TEMP_MODEL_PATH);
-          if (!testResult.success) {
-            await RNFS.unlink(TEMP_MODEL_PATH);
-            throw new Error(`Model load test failed: ${testResult.error}`);
-          }
+          // Skip testModelLoad — it fully loads the 2.8 GB model into RAM
+          // just to validate, which risks OOM on constrained devices.
+          // The model will be loaded properly on the Splash screen.
 
           await RNFS.moveFile(TEMP_MODEL_PATH, MODEL_PATH);
           await clearDownloadState();
@@ -845,8 +1040,12 @@ export const downloadModel = async (onProgress, onCancel) => {
             size: downloadedSize,
             completed: true,
             timestamp: Date.now(),
+            installedAt: Date.now(),
+            downloadedFrom: MODEL_URL,
+            source: 'managed_runtime_download',
           });
 
+          await setModelLifecycleState(MODEL_LIFECYCLE_STATES.READY_ON_DISK);
           await releaseDownloadLock();
           downloadCancellationPromise = null;
           activeDownload = null;
@@ -854,51 +1053,38 @@ export const downloadModel = async (onProgress, onCancel) => {
         } catch (e) {
           console.error('Download failed:', e.message, 'attempt:', attempt);
 
+          // Clean up partial temp file — RNFS cannot resume, so keeping
+          // it around is pointless and wastes disk space.
           if (await RNFS.exists(TEMP_MODEL_PATH)) {
-            const stat = await RNFS.stat(TEMP_MODEL_PATH);
-            const existingSize = parseInt(stat.size, 10);
-            if (existingSize > MIN_SIZE_BYTES * 0.5) {
-              console.log('Preserving partial download for resume:', existingSize);
-            } else {
-              await RNFS.unlink(TEMP_MODEL_PATH);
-            }
+            try { await RNFS.unlink(TEMP_MODEL_PATH); } catch (_) { /* ignore */ }
           }
 
           const statusCode = getNonRetryableStatusCode(e);
           if (statusCode && NON_RETRYABLE_ERRORS.has(statusCode)) {
+            await setModelLifecycleState(MODEL_LIFECYCLE_STATES.FAILED, { reason: e.message, attempt });
             await releaseDownloadLock();
             downloadCancellationPromise = null;
             activeDownload = null;
             throw e;
           }
 
-          if (e.message === 'Download cancelled' || e.message === 'Download timeout') {
-            if (downloadRef && downloadRef.cancel) {
-              try {
-                await downloadRef.cancel();
-              } catch (cancelErr) {
-                // ignore
-              }
-            }
-            await releaseDownloadLock();
-            downloadCancellationPromise = null;
-            activeDownload = null;
-            throw e;
-          }
+          const isStallError = e.message?.includes('stall') || e.message?.includes('timeout') || e.message?.includes(' stalled');
+          const isNetworkError = e.message?.includes('network') || e.message?.includes('ECONN') || e.message?.includes('ENET') || e.message?.includes('resolve host') || e.message?.includes('No address') || e.message?.includes('Unable to resolve host') || !e.message?.includes('status');
 
-          if (downloadRef && downloadRef.cancel) {
-            try {
-              await downloadRef.cancel();
-            } catch (cancelErr) {
-              // ignore
-            }
-          }
-
-          if (attempt < MAX_RETRIES) {
+          if (attempt < MAX_RETRIES && (isStallError || isNetworkError)) {
             const backoffDelay = calculateExponentialBackoff(attempt);
-            console.log(`Retrying in ${backoffDelay}ms...`);
+            console.log(`Retrying in ${backoffDelay}ms after: ${e.message}`);
+            onProgress?.({
+              downloaded: 0,
+              total: Math.round(MODEL_EXPECTED_SIZE / (1024 * 1024)),
+              percentage: 0,
+              attempt: attempt + 1,
+              stage: 'retrying',
+              error: e.message,
+            });
             await sleep(backoffDelay);
           } else {
+            await setModelLifecycleState(MODEL_LIFECYCLE_STATES.FAILED, { reason: e.message, attempt });
             await releaseDownloadLock();
             downloadCancellationPromise = null;
             activeDownload = null;
@@ -907,6 +1093,10 @@ export const downloadModel = async (onProgress, onCancel) => {
         }
       }
     } finally {
+      if (inactivityMonitorId) {
+        clearInterval(inactivityMonitorId);
+        inactivityMonitorId = null;
+      }
       if (downloadCancellationPromise) {
         downloadCancellationPromise = null;
       }
@@ -930,9 +1120,11 @@ export const deleteModel = async () => {
       await RNFS.unlink(TEMP_MODEL_PATH);
     }
     await clearModelMeta();
+    await setModelLifecycleState(MODEL_LIFECYCLE_STATES.NOT_DOWNLOADED);
     return true;
   } catch (e) {
     console.error('Error deleting model:', e);
+    await setModelLifecycleState(MODEL_LIFECYCLE_STATES.FAILED, { reason: e.message });
     return false;
   }
 };

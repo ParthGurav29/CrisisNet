@@ -25,7 +25,7 @@ pnpm-debug.log*
 android/build/
 android/app/build/
 android/app/build_intermediates/
-android/app/src/main/assets/
+android/app/src/main/assets/*.bundle
 android/local.properties
 android/.idea/
 android/.gradle/

@@ -462,6 +462,17 @@ npx react-native run-android
 5. Run: npx react-native run-android
 ```
 
+### Sideloading an APK (no Metro on the phone)
+
+Debug and release builds from Gradle **embed** `index.android.bundle`, so the app does not need `npx react-native start` when installed from an APK.
+
+```bash
+# Build and confirm the bundle is inside the APK (recommended before sharing)
+npm run verify:apk:build:debug    # or: npm run verify:apk:build (release)
+```
+
+Install the file under `android/app/build/outputs/apk/<debug|release>/app-arm64-v8a-*.apk` on a **64-bit ARM** device. If you see “Unable to load script”, see [docs/apk-runtime-verification.md](docs/apk-runtime-verification.md).
+
 ### Testing The Mesh
 
 ```
@@ -508,8 +519,13 @@ python train.py
 # Export quantized model for on-device use
 python export.py --format gguf --quantize 4bit
 
-# Move to assets folder
-cp survival-gemma-e2b.gguf ../assets/models/
+# Runtime model strategy (recommended):
+# Do NOT bundle GGUF into APK assets. Keep APK lightweight and let the app
+# download/verify/install the model on first launch using Model Manager UI.
+
+# Optional dev sideload (for local testing only):
+cp survival-gemma-e2b.gguf ../models/gemma-4-E2B-it-Q4_K_M.gguf
+./push_model.sh
 ```
 
 ---

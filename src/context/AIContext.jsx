@@ -1,5 +1,4 @@
 import React, { createContext, useState, useEffect, useCallback } from 'react';
-import { InteractionManager } from 'react-native';
 import AsyncStorage from '@react-native-async-storage/async-storage';
 import { loadModel, isModelLoaded as gemmaIsModelLoaded, generateResponse, getContext, getInitError, unloadModel, AIState as GemmaAIState } from '../ai/gemma';
 import { buildTriagePrompt, parseTriageResponse } from '../ai/triage';
@@ -43,6 +42,15 @@ const clearCachedAIState = async () => {
     // ignore
   }
 };
+
+const waitForMainThreadIdle = () =>
+  new Promise((resolve) => {
+    if (typeof global.requestIdleCallback === 'function') {
+      global.requestIdleCallback(() => resolve(), { timeout: 350 });
+      return;
+    }
+    setTimeout(resolve, 0);
+  });
 
 export const AIProvider = ({ children }) => {
   const [isModelLoaded, setIsModelLoaded] = useState(false);
@@ -112,10 +120,12 @@ export const AIProvider = ({ children }) => {
     };
     setAIState(AIState.LOADING);
     setAIError(null);
-    
-    const result = await InteractionManager.runAfterInteractions(async () => {
-      return await loadModel(handleProgress);
-    });
+
+    await waitForMainThreadIdle();
+    const rawResult = await loadModel(handleProgress);
+    const result = rawResult && typeof rawResult === 'object'
+      ? rawResult
+      : { success: false, error: 'Model loader returned an invalid result' };
 
     if (result.success) {
       const hasContext = getContext() !== null;
@@ -137,7 +147,10 @@ export const AIProvider = ({ children }) => {
       const modelFileExists = await modelExists();
       
       if (modelFileExists && !gemmaIsModelLoaded()) {
-        const result = await loadModel((p) => console.log('Background preload:', p));
+        const rawResult = await loadModel((p) => console.log('Background preload:', p));
+        const result = rawResult && typeof rawResult === 'object'
+          ? rawResult
+          : { success: false };
         if (result.success) {
           await setCachedAIState({ ready: getContext() !== null, timestamp: Date.now() });
         }
@@ -149,10 +162,6 @@ export const AIProvider = ({ children }) => {
     setIsGenerating(true);
     try {
       const response = await generateResponse(prompt, maxTokens);
-      if (response && response.retry) {
-        setAIState(AIState.FALLBACK);
-        setModelStatus('fallback');
-      }
       return response;
     } finally {
       setIsGenerating(false);

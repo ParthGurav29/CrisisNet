@@ -13,15 +13,7 @@ export default function SplashScreen({ navigation }) {
 
   useEffect(() => {
     let isMounted = true;
-    const startedAt = Date.now();
-    const MIN_SPLASH_MS = 1000;
-
-    const navigateWithMinimumSplash = async (routeName) => {
-      const elapsed = Date.now() - startedAt;
-      const remaining = Math.max(0, MIN_SPLASH_MS - elapsed);
-      if (remaining > 0) {
-        await new Promise(resolve => setTimeout(resolve, remaining));
-      }
+    const navigateSafely = (routeName) => {
       if (isMounted) {
         navigation.replace(routeName);
       }
@@ -38,21 +30,21 @@ export default function SplashScreen({ navigation }) {
             }
           });
           if (result?.success) {
-            await navigateWithMinimumSplash('Home');
+            navigateSafely('Home');
           } else {
             setError(result?.error || 'Failed to load model');
-            await navigateWithMinimumSplash('ModelDownload');
+            navigateSafely('ModelDownload');
           }
         } else {
           setProgress({ stage: 'Model missing', percent: 0 });
-          await navigateWithMinimumSplash('ModelDownload');
+          navigateSafely('ModelDownload');
         }
       } catch (e) {
         console.error('Error checking model:', e);
         if (isMounted) {
           setError('Failed to check model status');
         }
-        await navigateWithMinimumSplash('ModelDownload');
+        navigateSafely('ModelDownload');
       } finally {
         if (isMounted) {
           setChecking(false);
