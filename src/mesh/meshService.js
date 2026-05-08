@@ -48,12 +48,24 @@ import {
   updateSystemState,
   getQueueDelay,
 } from '../utils/modelStorage';
+import {
+  PACKET_TYPE,
+  createMessagePacket,
+  createAckPacket,
+  createNackPacket,
+  validatePacket,
+  isDuplicate,
+} from './packetFormat';
+import peerRegistry from './core/PeerRegistry';
+import { CRISISNET_MESH_SERVICE_UUID } from './core/crisisNetBleConstants';
 
 const DEBOUNCE_MS = 500;
 const MAX_QUEUE_SIZE = 100;
 const MAX_SEEN_MESSAGES = 1000;
 const APP_ID = 'com.crisisnet';
-const BROADCAST_RECIPIENT = '__broadcast__'; // synthetic marker, never sent as recipient
+const BROADCAST_RECIPIENT = '__broadcast__';
+const PEER_STALE_TIMEOUT_MS = 30000;
+const PEER_CLEANUP_INTERVAL_MS = 10000; // synthetic marker, never sent as recipient
 
 class MeshService extends EventEmitter {
   constructor() {
@@ -70,11 +82,14 @@ class MeshService extends EventEmitter {
     this.initPromise = null;
     this.restartDebounceTimer = null;
     this.pendingRestart = false;
+    this.peerCleanupTimer = null;
 
     this.messageQueue = [];
     this.seenMessageIds = new Set();
     this.retryCount = 0;
     this.totalRetries = 0;
+    this.pendingAcks = new Map();
+    this.ackTimeoutMs = 5000;
 
     this.protocolListeners = []; // [{ type, fn }]
   }
@@ -153,9 +168,14 @@ class MeshService extends EventEmitter {
     this.shortId = this.userId.substring(0, 6);
     console.log('[MESH] Device userId:', this.userId, 'shortId:', this.shortId);
 
-    // Configure SDK for BLE-only, unencrypted demo. Encryption requires MLS
-    // key exchange UX which we don't ship yet; flip `encryption.enabled` to
-    // true once a connection-request flow is in place.
+    // Native mesh identity / neighbor validation uses MLS-backed signing even
+    // when application payloads are plain JSON. The JS SDK only calls
+    // `initializeMlsWithSecureStorage()` during `start()` when
+    // `encryption.enabled` is true; leaving it false skips MLS entirely and
+    // produces errors like "MLS not initialized, cannot create signed
+    // identity" and blocked peers (unknown_candidate / non_mesh_cache).
+    // `requireEncryption: false` keeps MLS + auto key exchange for trust,
+    // without forcing ciphertext on every `sendMessage`.
     const config = {
       appId: APP_ID,
       userId: this.userId,
@@ -167,10 +187,17 @@ class MeshService extends EventEmitter {
         nostr: { enabled: false },
         reticulum: { enabled: false },
       },
-      encryption: { enabled: false },
+      encryption: {
+        enabled: true,
+        autoKeyExchange: true,
+        storePending: true,
+        requireEncryption: false,
+      },
       relay: { allowRelay: true, relayPriority: 'auto' },
       network: { initialTtl: 8 },
     };
+
+    console.log('[MESH] MLS bootstrap: enabling encryption config so SDK runs initializeMlsWithSecureStorage before native start');
 
     this.protocol = new OfflineProtocol(config);
     this._wireProtocolEvents();
@@ -183,7 +210,22 @@ class MeshService extends EventEmitter {
       throw e;
     }
 
+    try {
+      const mlsReady = await this.protocol.isMlsInitialized();
+      if (mlsReady) {
+        console.log('[MESH] MLS initialized successfully');
+        const pk = await this.protocol.getIdentityPublicKey();
+        const pkLen = Array.isArray(pk) ? pk.length : 0;
+        console.log('[MESH] Signed identity ready (identity public key bytes:', pkLen, ')');
+      } else {
+        console.warn('[MESH] MLS not ready after start — neighbor promotion / fragments may fail');
+      }
+    } catch (e) {
+      console.warn('[MESH] Post-start MLS verification failed:', e?.message || e);
+    }
+
     this.isInitialized = true;
+    this._startPeerCleanup();
     await this._updateSystemState();
 
     // The SDK's BLE transport is symmetric: it advertises + scans + serves
@@ -206,6 +248,10 @@ class MeshService extends EventEmitter {
     subscribe('neighbor_discovered', (event) => {
       const peerId = event?.peer_id;
       if (!peerId) return;
+      const rssi =
+        typeof event.rssi === 'number' && Number.isFinite(event.rssi) ? event.rssi : -95;
+      console.log('[MESH][REGISTRY] Peer added (mesh-sdk):', peerId, 'rssi=', rssi);
+      peerRegistry.updatePeer(peerId, rssi, { transport: event.transport || 'ble' });
       this.peers.set(peerId, {
         id: peerId,
         name: peerId.substring(0, 6),
@@ -221,6 +267,7 @@ class MeshService extends EventEmitter {
     subscribe('neighbor_lost', (event) => {
       const peerId = event?.peer_id;
       if (!peerId) return;
+      peerRegistry.removePeer(peerId);
       const existed = this.peers.delete(peerId);
       if (!existed) return;
       this.peerCount = this.peers.size;
@@ -228,22 +275,72 @@ class MeshService extends EventEmitter {
       this.emit('peer_lost', { id: peerId });
     });
 
-    subscribe('message_received', (event) => {
-      // Adapt SDK shape to the legacy shape MeshContext expects. MeshContext
-      // reads: event.content (string, JSON-or-text), event.senderId,
-      // event.message_id, event.timestamp.
+    subscribe('message_received', async (event) => {
+      this.peers.forEach((peer, peerId) => {
+        if (event.sender === peerId || event.sender === peer.id) {
+          peer.lastSeenMs = Date.now();
+        }
+      });
+
+      const content = event.content || '';
+      let packet;
+      try {
+        packet = JSON.parse(content);
+      } catch {
+        packet = null;
+      }
+
+      if (packet && packet.type === PACKET_TYPE.ACK) {
+        console.log('[MESH][E2E] ack_received', {
+          originalId: packet.originalId,
+          sender: event.sender,
+          contentBytes: typeof content === 'string' ? content.length : 0,
+        });
+        this._handleAck(packet);
+        return;
+      }
+
+      if (packet && packet.type === PACKET_TYPE.MESSAGE) {
+        if (isDuplicate(packet.id, this.seenMessageIds)) {
+          return;
+        }
+        if (packet.recipient && packet.recipient !== this.userId) {
+          return;
+        }
+        console.log('[MESH][E2E] message_received_assembled', {
+          packetId: packet.id,
+          sender: event.sender,
+          payloadChars: typeof packet.content === 'string' ? packet.content.length : 0,
+          hopCount: event.hop_count,
+          transport: event.transport,
+        });
+      }
+
       this.emit('message_received', {
-        message_id: event.message_id,
+        message_id: event.message_id || (packet ? packet.id : undefined),
         senderId: event.sender,
         sender: event.sender,
         content: event.content,
         timestamp: event.timestamp,
         hop_count: event.hop_count,
         transport: event.transport,
+        packet,
       });
+
+      if (packet && packet.type === PACKET_TYPE.MESSAGE && packet.recipient) {
+        await this._sendAck(packet.id, packet.sender);
+      }
     });
 
     subscribe('message_delivered', (event) => {
+      console.log('[MESH][E2E] message_delivered', {
+        crisisNetBleDiscoveryUuid: CRISISNET_MESH_SERVICE_UUID,
+        messageId: event.message_id,
+        latencyMs: event.latency_ms,
+        hopCount: event.hop_count,
+        transport: event.transport,
+        retryCount: event.retry_count,
+      });
       this.emit('message_delivered', {
         id: event.message_id,
         latencyMs: event.latency_ms,
@@ -254,7 +351,12 @@ class MeshService extends EventEmitter {
 
     subscribe('message_failed', (event) => {
       this.totalRetries += event.retry_count || 0;
-      console.warn('[MESH] message failed:', event.message_id, event.reason);
+      console.warn('[MESH][E2E] message_failed', {
+        messageId: event.message_id,
+        reason: event.reason,
+        retryCount: event.retry_count,
+        disconnectReason: event.disconnect_reason ?? event.disconnectReason,
+      });
     });
 
     subscribe('transport_switched', (event) => {
@@ -263,9 +365,54 @@ class MeshService extends EventEmitter {
 
     subscribe('diagnostic', (event) => {
       const tag = `[MESH:${event.level}]`;
-      if (event.level === 'error') console.error(tag, event.message, event.context || '');
-      else if (event.level === 'warning') console.warn(tag, event.message, event.context || '');
-      else console.log(tag, event.message);
+      const ctx =
+        event.context && Object.keys(event.context).length
+          ? JSON.stringify(event.context)
+          : '';
+      if (event.level === 'error') console.error(tag, event.message, ctx);
+      else if (event.level === 'warning') console.warn(tag, event.message, ctx);
+      else console.log(tag, event.message, ctx);
+    });
+
+    const logProto = (label, event) => {
+      try {
+        console.log('[MESH][PROTO]', label, JSON.stringify(event));
+      } catch {
+        console.log('[MESH][PROTO]', label, event);
+      }
+    };
+
+    subscribe('secure_session_established', (event) => {
+      logProto('neighbor/session: secure_session_established', event);
+    });
+    subscribe('secure_session_failed', (event) => {
+      logProto('neighbor/session: secure_session_failed', event);
+    });
+
+    subscribe('all', (event) => {
+      const t = event?.type;
+      if (
+        t === 'neighbor_discovered' ||
+        t === 'neighbor_lost' ||
+        t === 'diagnostic' ||
+        t === 'secure_session_established' ||
+        t === 'secure_session_failed'
+      ) {
+        return;
+      }
+      if (
+        typeof t === 'string' &&
+        (t.includes('welcome') ||
+          t.includes('connection') ||
+          t.includes('session') ||
+          t.includes('key') ||
+          t.includes('fragment') ||
+          t.includes('mesh') ||
+          t.includes('neighbor') ||
+          t.includes('route'))
+      ) {
+        logProto(`protocol event: ${t}`, event);
+      }
     });
   }
 
@@ -274,6 +421,19 @@ class MeshService extends EventEmitter {
       clearTimeout(this.restartDebounceTimer);
       this.restartDebounceTimer = null;
       this.pendingRestart = false;
+    }
+    this._stopPeerCleanup();
+    this.initPromise = null;
+    try {
+      peerRegistry.getPeers().forEach((p) => {
+        try {
+          peerRegistry.removePeer(p.id);
+        } catch {
+          /* ignore */
+        }
+      });
+    } catch {
+      /* ignore */
     }
     if (this.protocol) {
       try { await this.protocol.stop(); } catch (e) { /* ignore */ }
@@ -307,6 +467,7 @@ class MeshService extends EventEmitter {
       }, DEBOUNCE_MS);
 
       await this.stop();
+      this.isInitialized = false;
       await this.init();
     };
     return doRestart();
@@ -325,6 +486,11 @@ class MeshService extends EventEmitter {
   // ----- Identity --------------------------------------------------------
   getDeviceShortId() {
     return this.shortId || (this.userId ? this.userId.substring(0, 6) : 'unknown');
+  }
+
+  /** Mesh-sdk protocol user id (distinct from CrisisNet MeshManager identity.nodeId). */
+  getProtocolUserId() {
+    return this.userId || null;
   }
 
   // ----- Sending --------------------------------------------------------
@@ -382,7 +548,8 @@ class MeshService extends EventEmitter {
 
   _payloadPriority(payload) {
     if (payload && typeof payload === 'object') {
-      if (payload.type === 'emergency') return MessagePriority.Critical;
+      if (payload.type === 'emergency' || payload.emergency || payload.priority === 'critical') return MessagePriority.Critical;
+      if (payload.priority === 'high') return MessagePriority.High;
     }
     return MessagePriority.Medium;
   }
@@ -431,15 +598,46 @@ class MeshService extends EventEmitter {
     } catch { /* ignore */ }
   }
 
+  _startPeerCleanup() {
+    this.peerCleanupTimer = setInterval(() => {
+      const now = Date.now();
+      const stalePeers = [];
+      this.peers.forEach((peer, peerId) => {
+        if (now - peer.lastSeenMs > PEER_STALE_TIMEOUT_MS) {
+          stalePeers.push(peerId);
+        }
+      });
+      for (const peerId of stalePeers) {
+        this.peers.delete(peerId);
+        this.emit('peer_lost', { id: peerId });
+      }
+      if (stalePeers.length > 0) {
+        this.peerCount = this.peers.size;
+        this._updateNetworkQuality();
+      }
+    }, PEER_CLEANUP_INTERVAL_MS);
+  }
+
+  _stopPeerCleanup() {
+    if (this.peerCleanupTimer) {
+      clearInterval(this.peerCleanupTimer);
+      this.peerCleanupTimer = null;
+    }
+  }
+
   getStats() {
     return {
       peerCount: this.peerCount,
       networkQuality: this.networkQuality,
       messageQueueSize: this.messageQueue.length,
-      pendingAcks: 0,
+      pendingAcks: this.pendingAcks.size,
       retryCount: this.retryCount,
       totalRetries: this.totalRetries,
     };
+  }
+
+  getPeers() {
+    return Array.from(this.peers.values());
   }
 
   async getTopology() {
@@ -450,9 +648,76 @@ class MeshService extends EventEmitter {
     try { return await this.protocol?.getActiveTransports(); } catch { return []; }
   }
 
-  // Reserved for future use; kept for API compatibility.
-  static BROADCAST = BROADCAST_RECIPIENT;
+  _handleAck(packet) {
+    const pending = this.pendingAcks.get(packet.originalId);
+    if (pending) {
+      clearTimeout(pending.timeout);
+      this.pendingAcks.delete(packet.originalId);
+      if (pending.resolve) {
+        pending.resolve({ acknowledged: true, latencyMs: Date.now() - pending.timestamp });
+      }
+    }
+  }
+
+  async _sendAck(packetId, recipientId) {
+    if (!this.protocol || !this.isInitialized) return;
+    const ackPacket = createAckPacket(packetId, recipientId);
+    await this.protocol.sendMessage({
+      recipient: recipientId,
+      content: JSON.stringify(ackPacket),
+      priority: MessagePriority.Low,
+    }).catch(() => {});
+  }
+
+  async waitForAck(packetId, timeoutMs = this.ackTimeoutMs) {
+    return new Promise((resolve) => {
+      const timeout = setTimeout(() => {
+        this.pendingAcks.delete(packetId);
+        resolve({ acknowledged: false, reason: 'timeout' });
+      }, timeoutMs);
+
+      this.pendingAcks.set(packetId, {
+        timestamp: Date.now(),
+        resolve,
+        timeout,
+      });
+    });
+  }
+
+  /**
+   * Debug helper: unicast a JSON packet to one peer and wait for application-level ACK.
+   * Requires both devices to run this app version with ACK auto-reply on MESSAGE packets.
+   */
+  async verifyBidirectionalDelivery(peerId, body = { type: 'crisisnet_mesh_e2e', t: Date.now() }) {
+    if (!this.protocol || !this.isInitialized) {
+      throw new Error('mesh not initialized');
+    }
+    if (!peerId) {
+      throw new Error('peerId required');
+    }
+    const bodyStr = typeof body === 'string' ? body : JSON.stringify(body);
+    const packet = await createMessagePacket(bodyStr, peerId, 'high');
+    const wire = JSON.stringify(packet);
+    const t0 = Date.now();
+    console.log('[MESH][E2E] verify_send', {
+      peerId,
+      packetId: packet.id,
+      payloadBytes: wire.length,
+      crisisNetBleDiscoveryUuid: CRISISNET_MESH_SERVICE_UUID,
+    });
+    await this.protocol.sendMessage({
+      recipient: peerId,
+      content: wire,
+      priority: MessagePriority.High,
+   });
+    const ack = await this.waitForAck(packet.id, Math.max(this.ackTimeoutMs, 15000));
+    const elapsed = Date.now() - t0;
+    console.log('[MESH][E2E] verify_ack_result', { packetId: packet.id, elapsedMs: elapsed, ...ack });
+    return { packet, ack, elapsedMs: elapsed };
+  }
 }
+
+MeshService.BROADCAST = BROADCAST_RECIPIENT;
 
 const meshService = new MeshService();
 

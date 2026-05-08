@@ -27,7 +27,7 @@ export default function ChatScreen() {
     }
   };
 
-  const chatMessages = messages.filter(m => m.type === 'chat');
+  const chatMessages = messages.filter(m => m.type === 'chat' || m.type === 'msg');
   const displayShortId = myShortId || 'You';
 
   const getTriageColor = (tag) => {

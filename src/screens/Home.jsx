@@ -143,6 +143,9 @@ export default function HomeScreen({ navigation }) {
         <TouchableOpacity style={styles.quickBtn} onPress={() => navigation.navigate('Ask AI')}>
           <Text style={styles.quickBtnText}>🤖 AI</Text>
         </TouchableOpacity>
+        <TouchableOpacity style={[styles.quickBtn, { borderColor: '#4d9fff' }]} onPress={() => navigation.navigate('MeshDebug')}>
+          <Text style={[styles.quickBtnText, { color: '#4d9fff' }]}>🛠️ Debug</Text>
+        </TouchableOpacity>
       </View>
     </View>
   );

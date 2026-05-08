@@ -17,8 +17,11 @@ import SplashScreen from './screens/SplashScreen';
 import OnboardingScreen from './screens/OnboardingScreen';
 import KnowledgeBaseScreen from './screens/KnowledgeBaseScreen';
 import NoticeBoardScreen from './screens/NoticeBoardScreen';
+import MessagesScreen from './screens/Messages';
+import MeshDebugScreen from './screens/MeshDebugScreen';
 import { MeshProvider } from './context/MeshContext';
 import { AIProvider } from './context/AIContext';
+import meshManager from './mesh/core/MeshManager';
 
 const Stack = createNativeStackNavigator();
 const Tab = createBottomTabNavigator();
@@ -26,6 +29,7 @@ const Tab = createBottomTabNavigator();
 const TAB_ICONS = {
   Home: '🏠',
   Chat: '💬',
+  Messages: '📬',
   'Ask AI': '🤖',
   Triage: '🏥',
   Emergency: '🚨',
@@ -61,6 +65,7 @@ function MainTabs() {
     >
       <Tab.Screen name="Home" component={HomeScreen} />
       <Tab.Screen name="Chat" component={ChatScreen} />
+      <Tab.Screen name="Messages" component={MessagesScreen} />
       <Tab.Screen name="Ask AI" component={AskAIScreen} />
       <Tab.Screen name="Triage" component={TriageScreen} />
       <Tab.Screen name="Emergency" component={EmergencyScreen} options={{
@@ -88,6 +93,12 @@ export default function App() {
       await initializeSystemCoordinator();
       const granted = await requestPermissions();
       setPermissionsGranted(granted);
+      
+      if (granted) {
+        // Initialize the new Mesh Core foundation
+        meshManager.init().catch(e => console.error('MeshManager init failed:', e));
+      }
+
       const completed = await AsyncStorage.getItem('onboarding_complete');
       setHasCompletedOnboarding(completed === 'true');
       setIsLoading(false);
@@ -166,6 +177,7 @@ export default function App() {
                   <Stack.Screen name="Splash" component={SplashScreen} />
                   <Stack.Screen name="ModelDownload" component={ModelDownloadScreen} />
                   <Stack.Screen name="Home" component={MainTabs} />
+                  <Stack.Screen name="MeshDebug" component={MeshDebugScreen} />
                 </>
               )}
             </Stack.Navigator>

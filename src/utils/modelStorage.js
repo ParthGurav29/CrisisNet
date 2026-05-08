@@ -36,7 +36,7 @@ const createSha256Hasher = () => {
   };
 };
 
-const HF_TOKEN = 'ur token';
+const HF_TOKEN = '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';
 
 
 export const MODEL_FILENAME = 'gemma-4-E2B-it-Q4_K_M.gguf';

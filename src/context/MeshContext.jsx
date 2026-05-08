@@ -4,6 +4,7 @@ import meshService from '../mesh/meshService';
 import { getMessages, saveMessage, cleanupMessages } from '../storage/messages';
 import db from '../storage/db';
 import { getShortId } from '../storage/deviceId';
+import { createMessagePacket, PACKET_TYPE } from '../mesh/packetFormat';
 
 // Mesh state machine types
 const MeshState = {
@@ -56,13 +57,30 @@ export const MeshProvider = ({ children }) => {
       payload = { text: event.content || 'Unknown message' };
     }
 
-    let messageType = payload.type || 'chat';
+    let messageType = 'chat';
     let text = '';
     let triage = null;
+    let messageId = event.message_id;
 
-    if (messageType === 'emergency') {
+    if (payload.type === PACKET_TYPE.MESSAGE) {
+      messageId = payload.id || messageId;
+      if (payload.content && typeof payload.content === 'object') {
+        if (payload.content.emergency || payload.emergency) {
+          messageType = 'emergency';
+          text = payload.content.desc || 'Emergency Alert';
+          triage = payload.content.triage || 'YELLOW';
+        } else {
+          text = payload.content.text || payload.content.desc || JSON.stringify(payload.content);
+        }
+      } else if (typeof payload.content === 'string') {
+        text = payload.content;
+      } else {
+        text = payload.text || payload.desc || 'Unknown message';
+      }
+    } else if (payload.type === 'emergency') {
+      messageType = 'emergency';
       text = payload.desc || payload.text || 'Emergency Alert';
-      triage = payload.triage || payload.payload?.triage || 'YELLOW';
+      triage = payload.triage || 'YELLOW';
     } else {
       text = payload.text || (typeof payload === 'string' ? payload : 'Unknown message');
     }
@@ -71,11 +89,11 @@ export const MeshProvider = ({ children }) => {
     const senderShortId = rawSenderId.length > 6 ? rawSenderId.substring(0, 6) : rawSenderId;
 
     const newMessage = {
-      id: event.message_id || Math.random().toString(36).substring(7),
+      id: messageId || Math.random().toString(36).substring(7),
       sender: senderShortId,
       sender_id: senderShortId,
       text: text,
-      timestamp: event.timestamp || Date.now(),
+      timestamp: payload.timestamp || event.timestamp || Date.now(),
       type: messageType,
       triage: triage || payload.triage
     };
@@ -106,8 +124,8 @@ export const MeshProvider = ({ children }) => {
 
   const handleStarted = useCallback(() => {
     setIsConnected(true);
-    setScanning(false);
-    setAdvertising(false);
+    setScanning(true);
+    setAdvertising(true);
   }, []);
 
   const handleStopped = useCallback(() => {
@@ -150,6 +168,9 @@ export const MeshProvider = ({ children }) => {
       if (isMountedRef.current) {
         setMeshState(MeshState.READY);
         setMeshError(false);
+        setIsConnected(true);
+        setScanning(true);
+        setAdvertising(true);
       }
 
       meshService.flushQueue();
@@ -167,6 +188,7 @@ export const MeshProvider = ({ children }) => {
   const restartMesh = useCallback(async () => {
     if (meshRestartingRef.current) return;
     meshRestartingRef.current = true;
+    initAttemptedRef.current = false;
 
     setMeshState(MeshState.INITIALIZING);
     setMeshError(false);
@@ -177,6 +199,9 @@ export const MeshProvider = ({ children }) => {
       if (isMountedRef.current) {
         setMeshState(MeshState.READY);
         setMeshError(false);
+        setIsConnected(true);
+        setScanning(true);
+        setAdvertising(true);
       }
 
       meshService.flushQueue();
@@ -202,9 +227,24 @@ export const MeshProvider = ({ children }) => {
     meshService.on('stopped', handleStopped);
     meshService.on('scanning', handleScanning);
     meshService.on('advertising', handleAdvertising);
+    
+    // Also listen to the new MeshManager events
+    const { default: meshEvents } = require('../mesh/core/MeshEvents');
+    meshEvents.on('peer_discovered', (peer) => {
+      if (!peer?.id) return;
+      handlePeerDiscovered({
+        id: peer.id,
+        name: typeof peer.id === 'string' && peer.id.length > 6 ? peer.id.substring(0, 6) : peer.id,
+        transport: peer.capabilities?.transport || 'ble',
+      });
+    });
+    meshEvents.on('peer_lost', (peer) => {
+      handlePeerLost({ id: peer.peerId });
+    });
   }, [handlePeerDiscovered, handlePeerLost, handleMessageReceived, handleStarted, handleStopped, handleScanning, handleAdvertising]);
 
   const cleanupListeners = useCallback(() => {
+    listenersInitializedRef.current = false;
     meshService.off('peer_discovered', handlePeerDiscovered);
     meshService.off('peer_lost', handlePeerLost);
     meshService.off('message_received', handleMessageReceived);
@@ -212,6 +252,12 @@ export const MeshProvider = ({ children }) => {
     meshService.off('stopped', handleStopped);
     meshService.off('scanning', handleScanning);
     meshService.off('advertising', handleAdvertising);
+    
+    try {
+      const { default: meshEvents } = require('../mesh/core/MeshEvents');
+      meshEvents.removeAllListeners('peer_discovered');
+      meshEvents.removeAllListeners('peer_lost');
+    } catch (e) {}
   }, [handlePeerDiscovered, handlePeerLost, handleMessageReceived, handleStarted, handleStopped, handleScanning, handleAdvertising]);
 
   useEffect(() => {
@@ -220,14 +266,11 @@ export const MeshProvider = ({ children }) => {
 
     const handleAppStateChange = async (nextAppState) => {
       appStateRef.current = nextAppState;
-      if (nextAppState === 'background') {
-        try {
-          await meshService.stop();
-        } catch (e) {
-          // ignore
-        }
-      } else if (nextAppState === 'active') {
-        restartMesh();
+      // Lifecycle is now managed by MeshManager. 
+      // We don't stop the stack here to avoid conflicts.
+      if (nextAppState === 'active') {
+        const { default: meshManager } = require('../mesh/core/MeshManager');
+        meshManager.startDiscovery().catch(() => {});
       }
     };
 
@@ -241,11 +284,7 @@ export const MeshProvider = ({ children }) => {
   }, [initMesh, cleanupListeners, restartMesh]);
 
   useEffect(() => {
-    const timer = setTimeout(() => {
-      setupListeners();
-    }, 100);
-
-    return () => clearTimeout(timer);
+    setupListeners();
   }, [setupListeners]);
 
   const getStatusText = () => {
@@ -270,19 +309,23 @@ export const MeshProvider = ({ children }) => {
 
   const sendMessage = useCallback(async (text) => {
     try {
+      const packet = await createMessagePacket(text);
       const payload = {
-        text,
-        type: 'chat',
-        timestamp: Date.now(),
-        sender_id: myShortId
+        id: packet.id,
+        type: PACKET_TYPE.MESSAGE,
+        content: text,
+        sender: packet.sender,
+        recipient: packet.recipient,
+        timestamp: packet.timestamp,
+        priority: packet.priority
       };
       await meshService.sendMessage(payload);
       const myMessage = {
-        id: Math.random().toString(36).substring(7),
+        id: packet.id,
         sender: myShortId,
         sender_id: myShortId,
         text: text,
-        timestamp: Date.now(),
+        timestamp: packet.timestamp,
         type: 'chat'
       };
       setMessages((prev) => {
@@ -305,22 +348,30 @@ export const MeshProvider = ({ children }) => {
   const sendEmergency = useCallback(async (data) => {
     try {
       const shortId = myShortId;
+      const packet = await createMessagePacket(
+        JSON.stringify({ desc: data.desc || 'Emergency Alert', triage: data.color || 'YELLOW' }),
+        null,
+        'critical'
+      );
       const emergencyPacket = {
-        type: 'emergency',
-        sender_id: shortId,
-        timestamp: Date.now(),
-        desc: data.desc || 'Emergency Alert',
-        triage: data.color || 'YELLOW'
+        id: packet.id,
+        type: PACKET_TYPE.MESSAGE,
+        content: { desc: data.desc || 'Emergency Alert', triage: data.color || 'YELLOW' },
+        sender: packet.sender,
+        recipient: packet.recipient,
+        timestamp: packet.timestamp,
+        priority: packet.priority,
+        emergency: true
       };
 
       await meshService.sendMessage(emergencyPacket);
 
       const myMessage = {
-        id: Math.random().toString(36).substring(7),
+        id: packet.id,
         sender: shortId,
         sender_id: shortId,
         text: data.desc || 'Emergency Alert',
-        timestamp: Date.now(),
+        timestamp: packet.timestamp,
         type: 'emergency',
         triage: data.color || 'YELLOW'
       };
