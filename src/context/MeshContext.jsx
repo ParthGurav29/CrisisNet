@@ -40,7 +40,16 @@ export const MeshProvider = ({ children }) => {
   const handlePeerDiscovered = useCallback((peer) => {
     setNodes((prev) => {
       if (prev.find(n => n.id === peer.id)) return prev;
-      return [...prev, peer];
+      const peerState = peer.peerState || {
+        peerRegistered: false,
+        deviceIdResolved: false,
+        sessionEstablished: false,
+        linkReady: true,
+      };
+      return [...prev, {
+        ...peer,
+        peerState,
+      }];
     });
   }, []);
 
@@ -228,7 +237,14 @@ export const MeshProvider = ({ children }) => {
     meshService.on('scanning', handleScanning);
     meshService.on('advertising', handleAdvertising);
     
-    // Also listen to the new MeshManager events
+    meshService.on('message_delivered', (event) => {
+      console.log('[MESH][UI] message_delivered', event);
+    });
+    
+    meshService.on('message_failed', (event) => {
+      console.warn('[MESH][UI] message_failed', event);
+    });
+    
     const { default: meshEvents } = require('../mesh/core/MeshEvents');
     meshEvents.on('peer_discovered', (peer) => {
       if (!peer?.id) return;
@@ -236,6 +252,7 @@ export const MeshProvider = ({ children }) => {
         id: peer.id,
         name: typeof peer.id === 'string' && peer.id.length > 6 ? peer.id.substring(0, 6) : peer.id,
         transport: peer.capabilities?.transport || 'ble',
+        peerState: peer.peerState,
       });
     });
     meshEvents.on('peer_lost', (peer) => {
@@ -306,6 +323,37 @@ export const MeshProvider = ({ children }) => {
     nodesCount: nodes.length,
     getStatusText
   });
+
+  const sendMessageToNode = useCallback(async (nodeId, text) => {
+    try {
+      const payload = {
+        id: Date.now().toString(36) + Math.random().toString(36).substring(2, 9),
+        type: 'message',
+        content: text,
+        sender: meshService.getProtocolUserId(),
+        recipient: nodeId,
+        timestamp: Date.now()
+      };
+      await meshService.sendMessage(payload);
+    } catch (error) {
+      console.error('[MeshContext] sendMessageToNode failed:', error?.message);
+    }
+  }, []);
+
+  const broadcastMessage = useCallback(async (text) => {
+    try {
+      const payload = {
+        id: Date.now().toString(36) + Math.random().toString(36).substring(2, 9),
+        type: 'message',
+        content: text,
+        sender: meshService.getProtocolUserId(),
+        timestamp: Date.now()
+      };
+      await meshService.sendMessage(payload);
+    } catch (error) {
+      console.error('[MeshContext] broadcastMessage failed:', error?.message);
+    }
+  }, []);
 
   const sendMessage = useCallback(async (text) => {
     try {
@@ -413,6 +461,8 @@ export const MeshProvider = ({ children }) => {
         meshError,
         sendMessage,
         sendEmergency,
+        sendMessageToNode,
+        broadcastMessage,
         retryMesh: restartMesh,
         getStatus: getMeshStatus,
         clearMessages: async () => {

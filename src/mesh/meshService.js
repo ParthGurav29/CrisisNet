@@ -74,7 +74,7 @@ class MeshService extends EventEmitter {
     this.userId = null;
     this.shortId = null;
 
-    this.peers = new Map(); // peerId -> { id, name, transport, lastSeenMs, rssi? }
+    this.peers = new Map();
     this.peerCount = 0;
     this.networkQuality = 'unknown';
 
@@ -91,7 +91,37 @@ class MeshService extends EventEmitter {
     this.pendingAcks = new Map();
     this.ackTimeoutMs = 5000;
 
-    this.protocolListeners = []; // [{ type, fn }]
+    this.protocolListeners = [];
+
+    this.peerStates = new Map();
+  }
+
+  _getPeerState(peerId) {
+    if (!this.peerStates.has(peerId)) {
+      this.peerStates.set(peerId, {
+        peerRegistered: false,
+        deviceIdResolved: false,
+        sessionEstablished: false,
+        linkReady: false,
+        lastHelloTimestamp: 0,
+        lastPacketTimestamp: 0,
+        lastDecodeFailure: null,
+        pendingInboundFragments: 0,
+        pendingOutboundFragments: 0,
+      });
+    }
+    return this.peerStates.get(peerId);
+  }
+
+  _updatePeerState(peerId, updates) {
+    const state = this._getPeerState(peerId);
+    Object.assign(state, updates);
+    this._logPeerEvent('PEER_STATE_UPDATE', { peerId, ...updates });
+  }
+
+  _logPeerEvent(event, details) {
+    const timestamp = new Date().toISOString();
+    console.log(`[MESH][PEER] ${timestamp} ${event}`, JSON.stringify(details));
   }
 
   // ----- Hardened EventEmitter (matches previous behavior) ---------------
@@ -252,16 +282,31 @@ class MeshService extends EventEmitter {
         typeof event.rssi === 'number' && Number.isFinite(event.rssi) ? event.rssi : -95;
       console.log('[MESH][REGISTRY] Peer added (mesh-sdk):', peerId, 'rssi=', rssi);
       peerRegistry.updatePeer(peerId, rssi, { transport: event.transport || 'ble' });
+      
+      const peerState = this._getPeerState(peerId);
+      peerState.linkReady = true;
+      peerState.rssi = rssi;
+      
       this.peers.set(peerId, {
         id: peerId,
         name: peerId.substring(0, 6),
         transport: event.transport,
         rssi: event.rssi,
         lastSeenMs: Date.now(),
+        peerState,
       });
       this.peerCount = this.peers.size;
       this._updateNetworkQuality();
       this.emit('peer_discovered', { id: peerId, name: peerId.substring(0, 6), transport: event.transport });
+
+      this._logPeerEvent('HELLO_RX', { 
+        peerId, 
+        rssi, 
+        transport: event.transport,
+        linkReady: peerState.linkReady 
+      });
+
+      this._establishSessionForPeer(peerId);
     });
 
     subscribe('neighbor_lost', (event) => {
@@ -269,6 +314,9 @@ class MeshService extends EventEmitter {
       if (!peerId) return;
       peerRegistry.removePeer(peerId);
       const existed = this.peers.delete(peerId);
+      if (existed) {
+        this.peerStates.delete(peerId);
+      }
       if (!existed) return;
       this.peerCount = this.peers.size;
       this._updateNetworkQuality();
@@ -276,11 +324,14 @@ class MeshService extends EventEmitter {
     });
 
     subscribe('message_received', async (event) => {
-      this.peers.forEach((peer, peerId) => {
-        if (event.sender === peerId || event.sender === peer.id) {
-          peer.lastSeenMs = Date.now();
-        }
-      });
+      const peerId = event.sender;
+      if (peerId) {
+        this.peers.forEach((peer, pid) => {
+          if (event.sender === pid || event.sender === peer.id) {
+            peer.lastSeenMs = Date.now();
+          }
+        });
+      }
 
       const content = event.content || '';
       let packet;
@@ -288,6 +339,14 @@ class MeshService extends EventEmitter {
         packet = JSON.parse(content);
       } catch {
         packet = null;
+      }
+
+      if (packet && peerId) {
+        const state = this._getPeerState(peerId);
+        state.lastPacketTimestamp = Date.now();
+        if (!packet.type) {
+          state.lastDecodeFailure = 'missing packet type';
+        }
       }
 
       if (packet && packet.type === PACKET_TYPE.ACK) {
@@ -314,6 +373,7 @@ class MeshService extends EventEmitter {
           hopCount: event.hop_count,
           transport: event.transport,
         });
+        this._logPeerEvent('MESSAGE_RECEIVED', { peerId, packetId: packet.id, hopCount: event.hop_count });
       }
 
       this.emit('message_received', {
@@ -333,6 +393,14 @@ class MeshService extends EventEmitter {
     });
 
     subscribe('message_delivered', (event) => {
+      const peerId = event.recipient || event.peer_id;
+      if (peerId) {
+        this._logPeerEvent('MESSAGE_DELIVERED', { 
+          peerId, 
+          messageId: event.message_id,
+          latencyMs: event.latency_ms 
+        });
+      }
       console.log('[MESH][E2E] message_delivered', {
         crisisNetBleDiscoveryUuid: CRISISNET_MESH_SERVICE_UUID,
         messageId: event.message_id,
@@ -369,6 +437,18 @@ class MeshService extends EventEmitter {
         event.context && Object.keys(event.context).length
           ? JSON.stringify(event.context)
           : '';
+      
+      if (event.message && event.message.includes('fragment')) {
+        console.log('[MESH][FRAGMENT]', event.message, ctx);
+        const context = event.context || {};
+        if (event.message.includes('expired')) {
+          console.log('[MESH][FRAGMENT] PENDING_EXPIRED', ctx);
+        }
+        if (event.message.includes('reassembly')) {
+          console.log('[MESH][FRAGMENT] REASSEMBLY_COMPLETE', ctx);
+        }
+      }
+      
       if (event.level === 'error') console.error(tag, event.message, ctx);
       else if (event.level === 'warning') console.warn(tag, event.message, ctx);
       else console.log(tag, event.message, ctx);
@@ -383,9 +463,23 @@ class MeshService extends EventEmitter {
     };
 
     subscribe('secure_session_established', (event) => {
+      const peerId = event?.peer_id || event?.recipient_id;
+      if (peerId) {
+        this._logPeerEvent('SESSION_ESTABLISHED', { peerId, event });
+        const state = this._getPeerState(peerId);
+        state.sessionEstablished = true;
+        state.peerRegistered = true;
+        state.deviceIdResolved = true;
+        console.log('[MESH] Session established for peer:', peerId.slice(0, 8));
+      }
       logProto('neighbor/session: secure_session_established', event);
     });
     subscribe('secure_session_failed', (event) => {
+      const peerId = event?.peer_id || event?.recipient_id;
+      if (peerId) {
+        this._logPeerEvent('SESSION_FAILED', { peerId, reason: event?.reason, error: event?.error });
+        console.warn('[MESH] Session failed for peer:', peerId.slice(0, 8), event?.reason || event?.error);
+      }
       logProto('neighbor/session: secure_session_failed', event);
     });
 
@@ -414,6 +508,31 @@ class MeshService extends EventEmitter {
         logProto(`protocol event: ${t}`, event);
       }
     });
+  }
+
+  async _establishSessionForPeer(peerId) {
+    if (!this.protocol) {
+      this._logPeerEvent('SESSION_SKIPPED', { peerId, reason: 'protocol_not_ready' });
+      return;
+    }
+    
+    const state = this._getPeerState(peerId);
+    if (state.sessionEstablished) {
+      return;
+    }
+
+    this._logPeerEvent('SESSION_STARTING', { peerId });
+    
+    try {
+      const welcome = await this.protocol.establishSecureSession(peerId);
+      if (welcome) {
+        this._logPeerEvent('DEVICE_ID_RESOLVED', { peerId, resolved: true });
+        console.log('[MESH] establishSecureSession created welcome for', peerId.slice(0, 8));
+      }
+    } catch (e) {
+      this._logPeerEvent('SESSION_FAILED', { peerId, error: e?.message || e });
+      console.warn('[MESH] establishSecureSession failed for', peerId.slice(0, 8), e?.message || e);
+    }
   }
 
   async stop() {
@@ -522,23 +641,42 @@ class MeshService extends EventEmitter {
     const content = typeof payload === 'string' ? payload : JSON.stringify(payload);
     const priority = this._payloadPriority(payload);
 
-    if (this.peers.size === 0) {
+    const readyPeers = [];
+    for (const [peerId, peer] of this.peers.entries()) {
+      const state = this._getPeerState(peerId);
+      if (state.sessionEstablished && state.peerRegistered) {
+        readyPeers.push(peerId);
+      } else {
+        this._logPeerEvent('TX_GATED', { 
+          peerId, 
+          reason: 'session_not_ready',
+          sessionEstablished: state.sessionEstablished,
+          peerRegistered: state.peerRegistered
+        });
+      }
+    }
+
+    if (readyPeers.length === 0) {
       this.enqueueMessage(payload);
+      console.log('[MESH] No ready peers, queuing message:', messageId);
       return { id: messageId, queued: true };
     }
 
     const sendOps = [];
-    for (const [peerId] of this.peers) {
+    for (const peerId of readyPeers) {
       sendOps.push(
         this.protocol
           .sendMessage({ recipient: peerId, content, priority })
+          .then(() => {
+            this._logPeerEvent('MESSAGE_DELIVERED', { peerId, messageId, recipientCount: readyPeers.length });
+          })
           .catch((e) => {
             console.warn('[MESH] send to', peerId, 'failed:', e?.message || e);
           }),
       );
     }
     await Promise.all(sendOps);
-    return { id: messageId, recipients: this.peers.size };
+    return { id: messageId, recipients: readyPeers.length };
   }
 
   _payloadId(payload) {
@@ -637,7 +775,28 @@ class MeshService extends EventEmitter {
   }
 
   getPeers() {
-    return Array.from(this.peers.values());
+    return Array.from(this.peers.values()).map(peer => ({
+      ...peer,
+      peerState: this._getPeerState(peer.id),
+    }));
+  }
+
+  getPeerStates() {
+    const result = {};
+    for (const [peerId, state] of this.peerStates.entries()) {
+      result[peerId] = {
+        peerRegistered: state.peerRegistered,
+        deviceIdResolved: state.deviceIdResolved,
+        sessionEstablished: state.sessionEstablished,
+        linkReady: state.linkReady,
+        lastHelloTimestamp: state.lastHelloTimestamp,
+        lastPacketTimestamp: state.lastPacketTimestamp,
+        lastDecodeFailure: state.lastDecodeFailure,
+        pendingInboundFragments: state.pendingInboundFragments,
+        pendingOutboundFragments: state.pendingOutboundFragments,
+      };
+    }
+    return result;
   }
 
   async getTopology() {

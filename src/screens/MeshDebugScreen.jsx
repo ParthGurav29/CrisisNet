@@ -1,5 +1,5 @@
 import React, { useState, useEffect } from 'react';
-import { View, Text, ScrollView, StyleSheet, TouchableOpacity, SafeAreaView } from 'react-native';
+import { View, Text, ScrollView, StyleSheet, TouchableOpacity, SafeAreaView, Alert, TextInput } from 'react-native';
 import meshManager from '../mesh/core/MeshManager';
 import meshEvents from '../mesh/core/MeshEvents';
 import peerRegistry from '../mesh/core/PeerRegistry';
@@ -10,13 +10,18 @@ import bleScanner from '../mesh/core/BleScanner';
 import bleAdvertiser from '../mesh/core/BleAdvertiser';
 import meshService from '../mesh/meshService';
 import capabilities from '../mesh/core/Capabilities';
+import { useMesh } from '../hooks/useMesh';
+
+const PORT = 3001;
 
 export default function MeshDebugScreen() {
+  const { sendMessageToNode } = useMesh();
   const [state, setState] = useState(meshManager.getState());
   const [peers, setPeers] = useState(peerRegistry.getPeers());
   const [metrics, setMetrics] = useState(meshMetrics.getSnapshot());
   const [isScanning, setIsScanning] = useState(bleScanner.isScanning());
   const [isAdvertising, setIsAdvertising] = useState(bleAdvertiser.isActive());
+  const [messageText, setMessageText] = useState('');
 
   useEffect(() => {
     const onStateChanged = ({ newState }) => setState(newState);
@@ -51,6 +56,24 @@ export default function MeshDebugScreen() {
     };
   }, []);
 
+  const sendMessageToPeer = async (peerId, text) => {
+    if (!text.trim()) return;
+    try {
+      const payload = {
+        id: Date.now().toString(36) + Math.random().toString(36).substring(2, 9),
+        type: 'message',
+        content: text.trim(),
+        sender: meshService.getProtocolUserId(),
+        recipient: peerId,
+        timestamp: Date.now()
+      };
+      await meshService.sendMessage(payload);
+      Alert.alert('Message Sent', `Message sent to ${peerId.substring(0, 6)}`);
+    } catch (e) {
+      Alert.alert('Send Failed', e?.message || 'Unknown error');
+    }
+  };
+
   return (
     <SafeAreaView style={styles.container}>
       <View style={styles.header}>
@@ -76,6 +99,14 @@ export default function MeshDebugScreen() {
         </View>
 
         <View style={styles.section}>
+          <Text style={styles.sectionTitle}>API Endpoints (Express Server)</Text>
+          <StatusRow label="GET /api/nodes" value={`${PORT}:3001/api/nodes`} />
+          <StatusRow label="POST /api/nodes/:id/message" value="Send to specific node" />
+          <StatusRow label="POST /api/nodes/broadcast" value="Send to all nodes" />
+          <StatusRow label="GET /api/status" value="Mesh status" />
+        </View>
+
+        <View style={styles.section}>
           <Text style={styles.sectionTitle}>Discovery Metrics</Text>
           <StatusRow label="Peers (Nearby)" value={peers.length} />
           <StatusRow label="Peers (Connected)" value={metrics.connectionCount} color={metrics.connectionCount > 0 ? '#00cc66' : '#6677aa'} />
@@ -89,13 +120,7 @@ export default function MeshDebugScreen() {
             <Text style={styles.emptyText}>No peers discovered yet.</Text>
           ) : (
             peers.map(peer => (
-              <View key={peer.id} style={styles.peerCard}>
-                <Text style={styles.peerId}>{peer.id}</Text>
-                <View style={styles.peerDetails}>
-                  <Text style={styles.peerStat}>RSSI: {peer.rssi} dBm</Text>
-                  <Text style={styles.peerStat}>Seen: {Math.round((Date.now() - peer.lastSeen) / 1000)}s ago</Text>
-                </View>
-              </View>
+              <PeerCard key={peer.id} peer={peer} onSendMessage={sendMessageToPeer} />
             ))
           )}
         </View>
@@ -118,6 +143,41 @@ function StatusRow({ label, value, color = '#e0e8ff' }) {
     <View style={styles.row}>
       <Text style={styles.label}>{label}:</Text>
       <Text style={[styles.value, { color }]}>{value}</Text>
+    </View>
+  );
+}
+
+function PeerCard({ peer, onSendMessage }) {
+  const [message, setMessage] = useState('');
+  
+  const handleSend = () => {
+    if (message.trim()) {
+      onSendMessage(peer.id, message);
+      setMessage('');
+    }
+  };
+
+  return (
+    <View style={styles.peerCard}>
+      <View style={styles.peerHeader}>
+        <Text style={styles.peerId}>{peer.id?.substring(0, 8) || 'unknown'}...</Text>
+        <Text style={styles.peerRssi}>RSSI: {peer.rssi} dBm</Text>
+      </View>
+      <Text style={styles.peerDetail}>Transport: {peer.capabilities?.transport || 'ble'}</Text>
+      <Text style={styles.peerDetail}>Last seen: {Math.round((Date.now() - (peer.lastSeen || Date.now())) / 1000)}s ago</Text>
+      <View style={styles.messageInputRow}>
+        <TextInput
+          style={styles.messageInput}
+          value={message}
+          onChangeText={setMessage}
+          placeholder="Type message..."
+          placeholderTextColor="#3d4f70"
+          onSubmitEditing={handleSend}
+        />
+        <TouchableOpacity style={styles.sendBtn} onPress={handleSend}>
+          <Text style={styles.sendBtnText}>Send</Text>
+        </TouchableOpacity>
+      </View>
     </View>
   );
 }
@@ -185,19 +245,57 @@ const styles = StyleSheet.create({
     borderWidth: 1,
     borderColor: '#1e2d4a',
   },
+  peerHeader: {
+    flexDirection: 'row',
+    justifyContent: 'space-between',
+    alignItems: 'center',
+    marginBottom: 6,
+  },
   peerId: {
     color: '#4d9fff',
     fontSize: 14,
     fontWeight: '700',
   },
-  peerDetails: {
-    flexDirection: 'row',
-    justifyContent: 'space-between',
-    marginTop: 6,
+  peerRssi: {
+    color: '#6677aa',
+    fontSize: 11,
+  },
+  peerDetail: {
+    color: '#6677aa',
+    fontSize: 11,
+    marginBottom: 4,
   },
   peerStat: {
     color: '#6677aa',
     fontSize: 11,
+  },
+  messageInputRow: {
+    flexDirection: 'row',
+    alignItems: 'center',
+    gap: 8,
+    marginTop: 8,
+  },
+  messageInputContainer: {
+    flex: 1,
+    backgroundColor: '#1a2238',
+    borderRadius: 12,
+    paddingHorizontal: 10,
+    paddingVertical: 6,
+  },
+  messageInput: {
+    color: '#8899bb',
+    fontSize: 11,
+  },
+  sendBtn: {
+    backgroundColor: '#4d9fff',
+    borderRadius: 8,
+    paddingHorizontal: 12,
+    paddingVertical: 6,
+  },
+  sendBtnText: {
+    color: '#ffffff',
+    fontSize: 11,
+    fontWeight: '600',
   },
   footer: {
     flexDirection: 'row',

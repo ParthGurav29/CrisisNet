@@ -7,7 +7,7 @@ const RSSI_SMOOTHING_FACTOR = 3;
 
 class PeerRegistry {
   constructor() {
-    this.peers = new Map(); // peerId -> { id, rssiHistory, rssi, capabilities, lastSeen }
+    this.peers = new Map();
     this.cleanupTimer = null;
   }
 
@@ -37,19 +37,28 @@ class PeerRegistry {
         rssi: rssi,
         capabilities: capabilities,
         lastSeen: now,
+        peerState: {
+          peerRegistered: false,
+          deviceIdResolved: false,
+          sessionEstablished: false,
+          linkReady: true,
+          lastHelloTimestamp: now,
+          lastPacketTimestamp: 0,
+          lastDecodeFailure: null,
+          pendingInboundFragments: 0,
+          pendingOutboundFragments: 0,
+        },
       };
       this.peers.set(peerId, peer);
       meshLogger.info('registry', `New peer discovered: ${peerId} (RSSI: ${rssi})`);
       meshEvents.emit('peer_discovered', peer);
     } else {
-      // Update RSSI with smoothing
       peer.rssiHistory.push(rssi);
       if (peer.rssiHistory.length > RSSI_SMOOTHING_FACTOR) {
         peer.rssiHistory.shift();
       }
       peer.rssi = Math.round(peer.rssiHistory.reduce((a, b) => a + b, 0) / peer.rssiHistory.length);
       
-      // Update capabilities if provided
       if (Object.keys(capabilities).length > 0) {
         peer.capabilities = { ...peer.capabilities, ...capabilities };
       }
@@ -59,7 +68,6 @@ class PeerRegistry {
     }
   }
 
-  /** Remove immediately (e.g. mesh-sdk neighbor_lost); matches emit shape used in _cleanup. */
   removePeer(peerId) {
     if (!peerId || !this.peers.has(peerId)) return false;
     this.peers.delete(peerId);
@@ -90,6 +98,19 @@ class PeerRegistry {
 
   getPeerCount() {
     return this.peers.size;
+  }
+
+  getPeer(peerId) {
+    return this.peers.get(peerId);
+  }
+
+  updatePeerState(peerId, updates) {
+    const peer = this.peers.get(peerId);
+    if (peer) {
+      peer.peerState = { ...peer.peerState, ...updates };
+      return peer.peerState;
+    }
+    return null;
   }
 }
 

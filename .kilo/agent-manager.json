@@ -1,9 +1,20 @@
 {
-  "worktrees": {},
+  "worktrees": {
+    "wt-1778272568801-1": {
+      "branch": "chivalrous-zipper",
+      "path": "/Users/parthmangeshgurav/Desktop/CrisisNet/.kilo/worktrees/chivalrous-zipper",
+      "parentBranch": "main",
+      "createdAt": "2026-05-08T20:36:08.801Z",
+      "remote": "origin"
+    }
+  },
   "sessions": {},
   "tabOrder": {
     "local": [
       "pending:1"
     ]
-  }
+  },
+  "worktreeOrder": [
+    "wt-1778272568801-1"
+  ]
 }

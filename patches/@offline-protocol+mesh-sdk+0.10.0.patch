@@ -1,8 +1,27 @@
 diff --git a/node_modules/@offline-protocol/mesh-sdk/android/src/main/java/com/offlineprotocol/ble/BleTransportFacade.kt b/node_modules/@offline-protocol/mesh-sdk/android/src/main/java/com/offlineprotocol/ble/BleTransportFacade.kt
-index e44e64a..0dbdbc9 100644
+index e44e64a..f914081 100644
 --- a/node_modules/@offline-protocol/mesh-sdk/android/src/main/java/com/offlineprotocol/ble/BleTransportFacade.kt
 +++ b/node_modules/@offline-protocol/mesh-sdk/android/src/main/java/com/offlineprotocol/ble/BleTransportFacade.kt
-@@ -123,7 +123,11 @@ class BleTransportFacade(
+@@ -26,6 +26,7 @@ import uniffi.offline_protocol.OfflineProtocol
+ import android.bluetooth.BluetoothStatusCodes
+ import java.util.*
+ import java.util.concurrent.ConcurrentHashMap
++import java.util.concurrent.atomic.AtomicLong
+ import java.util.concurrent.CountDownLatch
+ import java.util.concurrent.ThreadLocalRandom
+ import kotlin.math.min
+@@ -97,6 +98,10 @@ class BleTransportFacade(
+     private val diagnosticEmitter: ((String, String, Map<String, Any?>) -> Unit)? = null
+ ) : TransportManager {
+ 
++    init {
++        Log.e("PATCH_CHECK", "PATCH_CHECK_ACTIVE")
++    }
++    
+     // MARK: - TransportManager Implementation
+     
+     override val transportId = "ble"
+@@ -123,7 +128,11 @@ class BleTransportFacade(
          // Fallback interval for fragment polling. Primary send path is event-driven
          // via onFragmentsAvailable(); this timer only catches edge cases.
          private const val FRAGMENT_POLL_INTERVAL_MS = 2000L
@@ -15,7 +34,7 @@ index e44e64a..0dbdbc9 100644
          /**
           * Hard cap on the number of fragments [drainAndSendFragments] will
           * pull from the Rust side in one main-thread tick. Above this we
-@@ -143,10 +147,10 @@ class BleTransportFacade(
+@@ -143,10 +152,10 @@ class BleTransportFacade(
          private const val MIN_RECONNECT_INTERVAL_MS = 5_000L
          
          // Adaptive Scan Configuration
@@ -30,7 +49,7 @@ index e44e64a..0dbdbc9 100644
          /** Peer count threshold below which we process all advertisements */
          private const val ADAPTIVE_LOW_DENSITY_THRESHOLD = 10
          /** Peer count threshold above which we apply maximum throttling */
-@@ -160,9 +164,9 @@ class BleTransportFacade(
+@@ -160,9 +169,9 @@ class BleTransportFacade(
          /** Cooldown between provisional bootstrap attempts for unknown devices */
          private const val UNKNOWN_BOOTSTRAP_RATE_LIMIT_MS = 12_000L
          /** Minimum RSSI required for provisional bootstrap attempt */
@@ -43,7 +62,7 @@ index e44e64a..0dbdbc9 100644
          /** Max provisional bootstrap attempts per minute */
          private const val MAX_UNKNOWN_BOOTSTRAP_ATTEMPTS_PER_MINUTE = 4
          /** Proactive scan refresh interval even when discoveries are occurring (ms) */
-@@ -201,6 +205,14 @@ class BleTransportFacade(
+@@ -201,6 +210,14 @@ class BleTransportFacade(
          }
      }
      
@@ -58,7 +77,7 @@ index e44e64a..0dbdbc9 100644
      // MARK: - Properties
      
      private val bluetoothManager: BluetoothManager = 
-@@ -278,6 +290,10 @@ class BleTransportFacade(
+@@ -278,10 +295,14 @@ class BleTransportFacade(
                  ) = this@BleTransportFacade.learnRouteFromMessage(messageJson, neighborId, neighborAddress)
                  override fun drainAndSendFragments() =
                      this@BleTransportFacade.drainAndSendFragments()
@@ -69,7 +88,12 @@ index e44e64a..0dbdbc9 100644
                  override fun handleInboundFragment(address: String, data: ByteArray) =
                      this@BleTransportFacade.handleReceivedData(data, address)
                  override fun connectToDevice(device: BluetoothDevice) =
-@@ -378,7 +394,7 @@ class BleTransportFacade(
+-                    this@BleTransportFacade.connectToDevice(device)
++                    this@BleTransportFacade.connectToDevice(device, null)
+ 
+                 override fun onPeerMtuNegotiated(address: String, maxPayload: Int) {
+                     // Called from the binder GATT callback thread. Repost
+@@ -378,7 +399,7 @@ class BleTransportFacade(
      // [CentralGattClient.Host.onDeviceIdResolved] once the reverse GATT
      // read has mapped the address to a stable device id — at that point
      // we flush into Rust via `protocol.bleSetPeerMtu` so the fragmenter
@@ -78,7 +102,7 @@ index e44e64a..0dbdbc9 100644
      // fallback. Entries are removed on successful flush (so a reconnect
      // cannot observe a stale value) and on disconnect alongside the
      // matching `bleClearPeerMtu` call. Main-thread only — every access
-@@ -386,6 +402,33 @@ class BleTransportFacade(
+@@ -386,6 +407,35 @@ class BleTransportFacade(
      // to make the discipline visible rather than silently tolerate cross-
      // thread writes.
      private val peerMaxPayloads = HashMap<String, Int>()
@@ -109,10 +133,12 @@ index e44e64a..0dbdbc9 100644
 +     * tear-down paths that drop the outbound lane mid-write.
 +     */
 +    private var gattMessageWriteOwnerAddress: String? = null
++    /** Monotonic counter for live (non–pending-drain) calls into [protocol.bleFragmentReceived]. */
++    private val bleDirectProtoIngestSeq = AtomicLong(0)
      private val discoveryLogTimestamps = ConcurrentHashMap<String, Long>()
      @Volatile private var lastDiscoveryAt: Long = 0L
  
-@@ -882,6 +925,7 @@ class BleTransportFacade(
+@@ -882,6 +932,7 @@ class BleTransportFacade(
          lastSeenRssi.clear()
          pendingInbound.clear()
          outboundQueue.clear()
@@ -120,7 +146,7 @@ index e44e64a..0dbdbc9 100644
          // Drop any negotiated-MTU values staged by the prior session.
          // Per-disconnect paths (dropStagedPeerMtu) already handle most
          // entries, but a transport stop mid-handshake (MTU staged,
-@@ -1421,15 +1465,16 @@ class BleTransportFacade(
+@@ -1421,15 +1472,16 @@ class BleTransportFacade(
      private fun buildAdvertiseData(): AdvertiseData {
          val meshData = meshController.toAdvertisement()
          lastMeshAdvertisement = meshData
@@ -134,7 +160,7 @@ index e44e64a..0dbdbc9 100644
 +            "uuid=${CrisisNetBleDiscovery.SERVICE_UUID} payloadLen=${crisisPayload.size} " +
 +                "payloadHex=${crisisPayload.joinToString("") { b -> "%02x".format(b.toInt() and 0xff) }}",
 +        )
-+        // Legacy ADV ≤31 B including flags. CrisisNet v1 service data is 10 B; v2 (12 B) overflows.
++        // CrisisNet v2 service data: 18 B payload carries version, roleTieU16, and mesh identity.
          return AdvertiseData.Builder()
              .setIncludeDeviceName(false)
 -            .addServiceUuid(ParcelUuid(SERVICE_UUID))
@@ -144,7 +170,7 @@ index e44e64a..0dbdbc9 100644
              .build()
      }
  
-@@ -1437,9 +1482,8 @@ class BleTransportFacade(
+@@ -1437,9 +1489,8 @@ class BleTransportFacade(
       * Builds the scan response data for BLE advertising.
       *
       * iOS's CoreBluetooth actively queries for scan responses during BLE scanning.
@@ -156,7 +182,7 @@ index e44e64a..0dbdbc9 100644
       */
      private fun buildScanResponse(): AdvertiseData {
          return AdvertiseData.Builder()
-@@ -1506,7 +1550,7 @@ class BleTransportFacade(
+@@ -1506,7 +1557,7 @@ class BleTransportFacade(
          
          // Extract service information for logging
          val serviceUuids = scanRecord?.serviceUuids
@@ -165,7 +191,16 @@ index e44e64a..0dbdbc9 100644
          
          val lastLog = discoveryLogTimestamps[address]
          if (lastLog == null || now - lastLog > 30000) {
-@@ -1672,7 +1716,7 @@ class BleTransportFacade(
+@@ -1605,7 +1656,7 @@ class BleTransportFacade(
+ 
+         if (connections.getGatt(address) == null) {
+             connections.setPendingRole(address, desiredRole)
+-            connectToDevice(device)
++            connectToDevice(device, meshMetadata)
+         } else if (logThrottler.shouldLog("discovery_existing_$address", intervalMs = 30000)) {
+             Log.v(TAG, "Device $address already connected/connecting")
+         }
+@@ -1672,7 +1723,7 @@ class BleTransportFacade(
          }
          
          // 2. Check for our service data
@@ -174,7 +209,7 @@ index e44e64a..0dbdbc9 100644
          if (serviceData != null) {
              return true
          }
-@@ -1863,8 +1907,8 @@ class BleTransportFacade(
+@@ -1863,8 +1914,8 @@ class BleTransportFacade(
                  hash = 31 * hash + uuid.hashCode()
              }
              
@@ -185,543 +220,70 @@ index e44e64a..0dbdbc9 100644
              if (serviceData != null) {
                  hash = 31 * hash + serviceData.contentHashCode()
              }
-@@ -1934,7 +1978,7 @@ class BleTransportFacade(
-      * deviceId-first-then-MTU path (triggered from
-      * [CentralGattClient.Host.onPeerMtuNegotiated] when the address already
-      * has a resolved identifier). Idempotent: if no staged value exists the
--     * call is a no-op and the Rust fragmenter falls back to the 185-byte
-+     * call is a no-op and the Rust fragmenter falls back to the 20-byte
-      * floor for that peer.
-      *
-      * On successful flush the staged entry is removed so that a reconnect
-@@ -1976,7 +2020,7 @@ class BleTransportFacade(
-      * paths must never touch it directly: a peripheral-role
-      * disconnect, eviction, or give-up for a peer that still has an
-      * alive central-role link would otherwise demote that link from
--     * its negotiated BLE 5 MTU back to the 185-byte floor for the
-+     * its negotiated BLE 5 MTU back to the 20-byte floor for the
-      * rest of the link's life. See the comment block in
-      * [handleCentralDisconnectedOnMain] for the bug this invariant
-      * exists to prevent.
-@@ -2063,6 +2107,8 @@ class BleTransportFacade(
-                 Log.i(TAG, "Evicting peer $peerId to reclaim capacity (reason=$reason)")
-             }
+@@ -1876,10 +1927,63 @@ class BleTransportFacade(
+     /** Lock for atomic connection count check and connect operations */
+     private val connectionLock = Any()
  
-+            discardBleOutboundLane(address, requeuePendingFragments = false)
-+
-             connections.getGatt(address)?.let { gatt ->
-                 try {
-                     gatt.disconnect()
-@@ -2210,6 +2256,21 @@ class BleTransportFacade(
- 
-         if (state != TransportState.RUNNING) return
- 
-+        val serializedLaneAddresses = synchronized(bleOutboundSync) {
-+            (bleOutboundQueues.keys + bleOutboundInflight.keys).toSet()
-+        }
-+        for (laneAddr in serializedLaneAddresses) {
-+            bleTryStartOutboundWriteForAddress(laneAddr)
-+        }
-+        if (serializedLaneAddresses.isNotEmpty()) {
-+            Log.d(
-+                "BLE_TX",
-+                "TX_NEXT triedLanes=${serializedLaneAddresses.size} globalOwner=$gattMessageWriteOwnerAddress",
-+            )
-+        }
-+
-+        if (state != TransportState.RUNNING) return
-+
-         if (hitIterationCap) {
-             mainHandler.post { drainAndSendFragments() }
-         } else if (hitBackpressure && outboundQueue.totalCount() > 0) {
-@@ -2298,64 +2359,121 @@ class BleTransportFacade(
-         return null
-     }
- 
--    private fun sendFragmentData(recipientId: String, data: ByteArray): Boolean {
--        // Every call site (drainAndSendFragments, pollAndSendFragments, the
--        // OutboundFragmentQueue.flush callback) runs on main already, but
--        // the function mutates main-only state (bytesSent, fragmentsSent),
--        // calls into MeshController, and issues gatt.writeCharacteristic —
--        // which the Android BLE stack serialises one op at a time per
--        // client. A future caller that forgets this contract would
--        // silently corrupt counters and interleave writes, so pin it to
--        // the runtime check that the rest of the facade's main-thread
--        // invariants already use.
--        assertMainThread("sendFragmentData")
--        // Find GATT client for recipient
--        val address = resolveTargetAddress(recipientId)
--        val gatt = address?.let { connections.getGatt(it) }
-+    private fun resetBleOutboundSerializationState() {
-+        synchronized(bleOutboundSync) {
-+            bleOutboundQueues.clear()
-+            bleOutboundInflight.clear()
-+        }
-+        gattMessageWriteOwnerAddress = null
-+    }
- 
--        // Until the remote has ack'd our CCCD write, the return path is not
--        // verified and the BLE stack may still be executing the setup ops
--        // (deviceId read → identity read → writeDescriptor). Issuing a write
--        // now risks either silent loss (on stacks that drop the op) or
--        // stalling the chain. Enqueue and let onDescriptorWrite trigger the
--        // drain.
--        if (address != null && !centralClient.isLinkReady(address)) {
--            if (logThrottler.shouldLog("link_not_ready_$recipientId", intervalMs = 5000)) {
--                Log.d(TAG, "Link to $recipientId not yet ready (CCCD unacked), deferring write")
+-    private fun connectToDevice(device: BluetoothDevice) {
 +    /**
-+     * Drop the per-address serialized BLE writer state. Safe from any thread;
-+     * optional requeue to [outboundQueue] always runs on the main looper.
++     * Deterministic outbound (central-role) connection ownership per peer pair so only
++     * one device calls [BluetoothDevice.connectGatt] for a pairing — avoids dual-initiate
++     * churn on Android when both sides would otherwise connect symmetrically.
++     *
++     * Election: INITIATOR when [Long.compareUnsigned] (local [MeshAdvertisementData.nodeIdHash],
++     * remote) is strictly positive; PASSIVE when negative; tie broken by BLE address / [deviceId]
++     * lexical compare. When advert metadata is absent, BLE–address tie-break vs [localComparableBleKey] only.
 +     */
-+    fun discardBleOutboundLane(address: String, requeuePendingFragments: Boolean) {
-+        val drained = synchronized(bleOutboundSync) {
-+            val inflight = bleOutboundInflight.remove(address)
-+            val q = bleOutboundQueues.remove(address)
-+            buildList {
-+                inflight?.let { add(it) }
-+                if (q != null) {
-+                    while (q.isNotEmpty()) {
-+                        add(q.removeFirst())
-+                    }
-+                }
-             }
--            return false
-         }
-+        if (drained.isNotEmpty() && gattMessageWriteOwnerAddress == address) {
-+            gattMessageWriteOwnerAddress = null
-+        }
-+        if (drained.isEmpty()) return
-+        if (!requeuePendingFragments) return
-+        val enqueueOnMain = Runnable {
-+            if (state != TransportState.RUNNING || shuttingDown) return@Runnable
-+            drained.forEach { outboundQueue.enqueue(it.recipientId, it.data) }
-+        }
-+        if (Looper.myLooper() == Looper.getMainLooper()) {
-+            enqueueOnMain.run()
-+        } else {
-+            mainHandler.post(enqueueOnMain)
-+        }
-+    }
- 
--        if (gatt == null) {
--            //  Proactively try to connect if we don't have a connection
--            // This helps resolve cases where fragments are queued but connection isn't established
--            if (logThrottler.shouldLog("missing_gatt_$recipientId", intervalMs = 5000)) {
--                Log.w(TAG, "No connected device for recipient: $recipientId - attempting to find and connect")
--                emitDiagnostic("warning", "No connected device for BLE fragment - attempting connection", mapOf("recipientId" to recipientId))
-+    private fun onBleMessageCharacteristicWriteFinished(address: String, status: Int) {
-+        assertMainThread("onBleMessageCharacteristicWriteFinished")
-+        synchronized(bleOutboundSync) {
-+            bleOutboundInflight.remove(address)
-+        }
-+        Log.i(
-+            "BLE_TX",
-+            "TX_WRITE_CALLBACK status=$status addr=$address globalOwnerWas=$gattMessageWriteOwnerAddress",
-+        )
-+        if (gattMessageWriteOwnerAddress != null && gattMessageWriteOwnerAddress != address) {
-+            Log.w(
-+                TAG,
-+                "BLE_TX owner mismatch: callback addr=$address expectedOwner=$gattMessageWriteOwnerAddress",
-+            )
-+        }
-+        gattMessageWriteOwnerAddress = null
-+        if (status != BluetoothGatt.GATT_SUCCESS &&
-+            logThrottler.shouldLog("ble_tx_status_$address", intervalMs = 3000)) {
-+            Log.w(TAG, "BLE outbound write ended with status=$status addr=$address")
-+            emitDiagnostic(
-+                "warning",
-+                "BLE message characteristic write ended non-successfully",
-+                mapOf("address" to address, "status" to status),
-+            )
-+        }
-+        if (state == TransportState.RUNNING && !shuttingDown) {
-+            drainAndSendFragments()
-+        }
++    private fun localNodeAdvertForRoleElection(): MeshAdvertisementData {
++        val cached = lastMeshAdvertisement
++        if (cached != null) return cached
++        return meshController.toAdvertisement()
 +    }
 +
-+    /**
-+     * Dequeues one pending fragment for [address] (when no write is already
-+     * in flight), issues `writeCharacteristic`, and bumps TX counters once
-+     * the stack accepts the operation.
-+     */
-+    private fun bleTryStartOutboundWriteForAddress(address: String) {
-+        assertMainThread("bleTryStartOutboundWriteForAddress")
-+        if (gattMessageWriteOwnerAddress != null) {
-+            if (logThrottler.shouldLog("ble_tx_blocked_$address", intervalMs = 2000)) {
-+                Log.d(
-+                    "BLE_TX",
-+                    "TX_BLOCKED lane=$address globalOwner=${gattMessageWriteOwnerAddress} TX_INFLIGHT=true",
-+                )
-+            }
-+            return
++    private fun localComparableBleKey(): String {
++        val a = bluetoothAdapter?.address?.trim()
++        if (!a.isNullOrEmpty() && !a.equals("02:00:00:00:00:00", ignoreCase = true)) {
++            return a.uppercase(Locale.US)
 +        }
-+        val pending = synchronized(bleOutboundSync) {
-+            if (bleOutboundInflight.containsKey(address)) return
-+            val q = bleOutboundQueues[address]
-+            if (q == null || q.isEmpty()) {
-+                bleOutboundQueues.remove(address)
-+                return
-             }
-+            val p = q.removeFirst()
-+            if (q.isEmpty()) bleOutboundQueues.remove(address)
-+            bleOutboundInflight[address] = p
-+            p
-+        }
- 
--            // Try to find the device and connect
--            if (address != null) {
--                // We know the address but don't have a connection - try to reconnect
--                bluetoothAdapter?.let { adapter ->
--                    try {
--                        val device = adapter.getRemoteDevice(address)
--                        connectToDevice(device)
--                    } catch (e: Exception) {
--                        Log.e(TAG, "Error attempting reconnection for $recipientId", e)
--                    }
-+        val gatt = connections.getGatt(address)
-+        if (gatt == null || !centralClient.isLinkReady(address)) {
-+            synchronized(bleOutboundSync) {
-+                if (bleOutboundInflight.remove(address) == pending) {
-+                    val q = bleOutboundQueues.getOrPut(address) { ArrayDeque() }
-+                    q.addFirst(pending)
-                 }
--            } else {
--                // We don't even know the address - this is a more serious issue
--                // The device ID might not be resolved yet or route might not exist
--                Log.w(TAG, "Cannot resolve address for recipient: $recipientId")
-             }
--            return false
-+            return
-         }
- 
--        //  Validate connection state before attempting to send
-+        val recipientId = pending.recipientId
-+        val data = pending.data
-+
-         if (gatt.device.bondState == BluetoothDevice.BOND_NONE) {
--            // Device is not bonded - this might be okay for BLE, but log it
-             if (logThrottler.shouldLog("unbonded_device_$recipientId", intervalMs = 10000)) {
-                 Log.d(TAG, "Device $recipientId is not bonded (this may be normal for BLE)")
-             }
-@@ -2363,34 +2481,42 @@ class BleTransportFacade(
- 
-         val service = gatt.getService(SERVICE_UUID)
-         val characteristic = service?.getCharacteristic(MESSAGE_CHAR_UUID)
--        
-         if (service == null || characteristic == null) {
-+            synchronized(bleOutboundSync) {
-+                if (bleOutboundInflight.remove(address) == pending) {
-+                    val q = bleOutboundQueues.getOrPut(address) { ArrayDeque() }
-+                    q.addFirst(pending)
-+                }
-+            }
-             if (logThrottler.shouldLog("missing_char_$recipientId")) {
-                 Log.w(TAG, "Message characteristic not found for recipient: $recipientId")
-                 emitDiagnostic("warning", "Message characteristic missing", mapOf("recipientId" to recipientId))
-             }
--            return false
-+            return
-         }
- 
--        characteristic.writeType = BluetoothGattCharacteristic.WRITE_TYPE_NO_RESPONSE
-+        characteristic.writeType = BluetoothGattCharacteristic.WRITE_TYPE_DEFAULT
-+
-+        gattMessageWriteOwnerAddress = address
-+        Log.i(
-+            "BLE_TX",
-+            "TX_START TX_WRITE_CALLED addr=$address recipient=$recipientId len=${data.size} TX_INFLIGHT=true",
-+        )
- 
--        // On API 33+ we use the value-parameter overload, which returns a
--        // BluetoothStatusCodes result. On older APIs we have to set the shared
--        // characteristic value field and call the legacy overload — its
--        // Boolean return *is* load-bearing: it reports false when the internal
--        // TX queue is full, another GATT op is in flight, or the characteristic
--        // is unwritable. Treating every pre-Tiramisu call as success silently
--        // drops fragments, which is exactly the class of bug the rest of this
--        // code is trying to defend against.
-         val writeOk = try {
-             if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.TIRAMISU) {
--                val result = gatt.writeCharacteristic(characteristic, data, BluetoothGattCharacteristic.WRITE_TYPE_NO_RESPONSE)
-+                val result = gatt.writeCharacteristic(
-+                    characteristic,
-+                    data,
-+                    BluetoothGattCharacteristic.WRITE_TYPE_DEFAULT,
-+                )
-                 if (result != BluetoothStatusCodes.SUCCESS) {
-                     Log.w(TAG, "Write characteristic returned non-success status: $result for recipient: $recipientId")
--                    emitDiagnostic("warning", "BLE write returned non-success status", mapOf(
--                        "recipientId" to recipientId,
--                        "status" to result.toString()
--                    ))
-+                    emitDiagnostic(
-+                        "warning",
-+                        "BLE write returned non-success status",
-+                        mapOf("recipientId" to recipientId, "status" to result.toString()),
-+                    )
-                     false
-                 } else {
-                     true
-@@ -2401,35 +2527,134 @@ class BleTransportFacade(
-                 @Suppress("DEPRECATION")
-                 val queued = gatt.writeCharacteristic(characteristic)
-                 if (!queued) {
--                    emitDiagnostic("warning", "BLE writeCharacteristic returned false", mapOf(
--                        "recipientId" to recipientId,
--                    ))
-+                    emitDiagnostic(
-+                        "warning",
-+                        "BLE writeCharacteristic returned false",
-+                        mapOf("recipientId" to recipientId),
-+                    )
-                 }
-                 queued
-             }
-         } catch (e: Exception) {
-             Log.e(TAG, "Error writing characteristic to $recipientId", e)
--            emitDiagnostic("error", "Error writing BLE fragment", mapOf(
--                "recipientId" to recipientId,
--                "exception" to e.javaClass.simpleName,
--                "message" to (e.message ?: "unknown")
--            ))
-+            emitDiagnostic(
-+                "error",
-+                "Error writing BLE fragment",
-+                mapOf(
-+                    "recipientId" to recipientId,
-+                    "exception" to e.javaClass.simpleName,
-+                    "message" to (e.message ?: "unknown"),
-+                ),
-+            )
-             false
-         }
- 
-         if (!writeOk) {
-+            if (gattMessageWriteOwnerAddress == address) {
-+                gattMessageWriteOwnerAddress = null
-+            }
-+            synchronized(bleOutboundSync) {
-+                if (bleOutboundInflight.remove(address) == pending) {
-+                    val q = bleOutboundQueues.getOrPut(address) { ArrayDeque() }
-+                    q.addFirst(pending)
-+                }
-+            }
-             if (logThrottler.shouldLog("write_failed_$recipientId", intervalMs = 2000)) {
--                Log.w(TAG, "Failed to write BLE fragment for $recipientId")
-+                Log.w(
-+                    TAG,
-+                    "Failed to write BLE fragment for $recipientId addr=$address len=${data.size} " +
-+                        "linkReady=${centralClient.isLinkReady(address)}",
-+                )
-                 emitDiagnostic("warning", "Failed to write BLE fragment", mapOf("recipientId" to recipientId))
-             }
--            return false
-+            Log.i("BLE_TX", "TX_RETRY_SCHEDULE lane=$address delayMs=$BACKPRESSURE_RETRY_MS TX_INFLIGHT=false")
-+            mainHandler.postDelayed(
-+                { drainAndSendFragments() },
-+                BACKPRESSURE_RETRY_MS,
-+            )
-+            return
-         }
- 
--        // Write was initiated successfully (actual completion is asynchronous for WRITE_TYPE_NO_RESPONSE)
-+        Log.i("BLE_TX", "TX_DISPATCHED awaiting stack callback addr=$address len=${data.size}")
-         bytesSent += data.size
-         fragmentsSent++
-         meshController.markPeerActive(recipientId)
-         meshController.markPeerActive(deviceId)
++        return deviceId.uppercase(Locale.US)
 +    }
 +
-+    private fun sendFragmentData(recipientId: String, data: ByteArray): Boolean {
-+        // Every call site (drainAndSendFragments, pollAndSendFragments, the
-+        // OutboundFragmentQueue.flush callback) runs on main already, but
-+        // the function mutates main-only state (bytesSent, fragmentsSent),
-+        // calls into MeshController, and ultimately drives
-+        // gatt.writeCharacteristic — which must be serialized process-wide
-+        // by [bleTryStartOutboundWriteForAddress] via [gattMessageWriteOwnerAddress]
-+        // (one in-flight central write at a time across all links).
-+        assertMainThread("sendFragmentData")
-+        val address = resolveTargetAddress(recipientId)
-+        val gatt = address?.let { connections.getGatt(it) }
-+
-+        // Until the remote has ack'd our CCCD write, the return path is not
-+        // verified and the BLE stack may still be executing the setup ops
-+        // (deviceId read → identity read → writeDescriptor). Issuing a write
-+        // now risks either silent loss (on stacks that drop the op) or
-+        // stalling the chain. Enqueue and let onDescriptorWrite trigger the
-+        // drain.
-+        if (address != null && !centralClient.isLinkReady(address)) {
-+            if (logThrottler.shouldLog("link_not_ready_$recipientId", intervalMs = 5000)) {
-+                Log.d(TAG, "Link to $recipientId not yet ready (CCCD unacked), deferring write")
-+            }
-+            return false
++    /** @return true if this device should open the outbound GATT client to [remoteDevice] */
++    private fun shouldInitiateCentralConnection(remoteMeta: MeshAdvertisementData?, remoteDevice: BluetoothDevice): Boolean {
++        val localHash = localNodeAdvertForRoleElection().nodeIdHash
++        val remoteHash = remoteMeta?.nodeIdHash
++        val remoteMac = remoteDevice.address.uppercase(Locale.US)
++        if (remoteHash != null) {
++            val cmp = java.lang.Long.compareUnsigned(localHash, remoteHash)
++            if (cmp > 0) return true
++            if (cmp < 0) return false
++            return localComparableBleKey() > remoteMac
 +        }
-+
-+        if (gatt == null) {
-+            if (logThrottler.shouldLog("missing_gatt_$recipientId", intervalMs = 5000)) {
-+                Log.w(TAG, "No connected device for recipient: $recipientId - attempting to find and connect")
-+                emitDiagnostic(
-+                    "warning",
-+                    "No connected device for BLE fragment - attempting connection",
-+                    mapOf("recipientId" to recipientId),
-+                )
-+            }
-+            if (address != null) {
-+                bluetoothAdapter?.let { adapter ->
-+                    try {
-+                        val device = adapter.getRemoteDevice(address)
-+                        connectToDevice(device)
-+                    } catch (e: Exception) {
-+                        Log.e(TAG, "Error attempting reconnection for $recipientId", e)
-+                    }
-+                }
-+            } else {
-+                Log.w(TAG, "Cannot resolve address for recipient: $recipientId")
-+            }
-+            return false
-+        }
-+
-+        if (gatt.device.bondState == BluetoothDevice.BOND_NONE) {
-+            if (logThrottler.shouldLog("unbonded_device_$recipientId", intervalMs = 10000)) {
-+                Log.d(TAG, "Device $recipientId is not bonded (this may be normal for BLE)")
-+            }
-+        }
-+
-+        val service = gatt.getService(SERVICE_UUID)
-+        if (service?.getCharacteristic(MESSAGE_CHAR_UUID) == null) {
-+            if (logThrottler.shouldLog("missing_char_$recipientId")) {
-+                Log.w(TAG, "Message characteristic not found for recipient: $recipientId")
-+                emitDiagnostic("warning", "Message characteristic missing", mapOf("recipientId" to recipientId))
-+            }
-+            return false
-+        }
-+
-+        synchronized(bleOutboundSync) {
-+            val q = bleOutboundQueues.getOrPut(address) { ArrayDeque() }
-+            q.addLast(PendingBleWrite(recipientId, data))
-+        }
-+        Log.i(
-+            "BLE_TX",
-+            "TX_ENQUEUE(write queued) addr=$address recipient=$recipientId len=${data.size} globalOwner=$gattMessageWriteOwnerAddress",
-+        )
-+        bleTryStartOutboundWriteForAddress(address)
-         return true
-     }
-     
-@@ -2660,7 +2885,7 @@ class BleTransportFacade(
-         
-         // In dense networks, apply stricter RSSI filtering
-         val threshold = when {
--            estimatedVisiblePeerCount > ADAPTIVE_HIGH_DENSITY_THRESHOLD -> -70
-+            estimatedVisiblePeerCount > ADAPTIVE_HIGH_DENSITY_THRESHOLD -> -95
-             estimatedVisiblePeerCount > ADAPTIVE_LOW_DENSITY_THRESHOLD -> ADAPTIVE_MIN_RSSI
-             else -> return false // Sparse network - accept all signals
-         }
-@@ -2946,7 +3171,7 @@ class BleTransportFacade(
-         // that race is owned by the central-role reconnect flow, which
-         // handles it locally by letting the next `onMtuChanged`
-         // overwrite the entry. Clearing here demoted an alive central-
--        // role link from its negotiated BLE 5 MTU back to the 185-byte
-+        // role link from its negotiated BLE 5 MTU back to the 20-byte
-         // floor for the rest of the link's life and made every
-         // subsequent send to that peer tick `fragment_fallback_count`.
-         // The non-clean branch below calls `blePeerLost` — a
-diff --git a/node_modules/@offline-protocol/mesh-sdk/android/src/main/java/com/offlineprotocol/ble/CentralGattClient.kt b/node_modules/@offline-protocol/mesh-sdk/android/src/main/java/com/offlineprotocol/ble/CentralGattClient.kt
-index a603ce0..e9f6004 100644
---- a/node_modules/@offline-protocol/mesh-sdk/android/src/main/java/com/offlineprotocol/ble/CentralGattClient.kt
-+++ b/node_modules/@offline-protocol/mesh-sdk/android/src/main/java/com/offlineprotocol/ble/CentralGattClient.kt
-@@ -99,6 +99,22 @@ internal class CentralGattClient(
-         fun learnRouteFromMessage(messageJson: String, neighborId: String, neighborAddress: String?)
-         fun drainAndSendFragments()
- 
-+        /**
-+         * Clear the facade's serialized outbound BLE lane for [address].
-+         * Safe from any thread — heavy work is bounced to main when re-queuing.
-+         *
-+         * @param requeuePendingFragments when true, any pending chunks (including one
-+         *   that was in flight on the ATT layer) move to [outboundQueue] for retry.
-+         */
-+        fun discardBleOutboundLane(address: String, requeuePendingFragments: Boolean)
-+
-+        /**
-+         * The Android BLE stack must not overlap `writeCharacteristic`
-+         * calls on a single [BluetoothGatt]. Invoked after the stack reports
-+         * completion for the message characteristic write.
-+         */
-+        fun onBleMessageCharacteristicWriteFinished(address: String, status: Int)
-+
-         /** Hand a received fragment to the facade (either via client
-          *  notify or via central-side write). Called on the main thread. */
-         fun handleInboundFragment(address: String, data: ByteArray)
-@@ -161,12 +177,10 @@ internal class CentralGattClient(
-         private const val MAX_DRAIN_ITERATIONS = 8
-         /** ATT MTU we ask for in `requestMtu`. 517 is the BLE 5 spec max;
-          *  controllers negotiate down to whatever both peers support. The
--         *  resulting payload = mtu − 3 is reported to Rust so the
--         *  fragmenter can size outbound chunks per peer. */
-+         *  resulting ATT write payload limit = mtu − 3 is reported to Rust. */
-         private const val REQUESTED_ATT_MTU = 517
-         /** ATT protocol overhead (opcode + attribute handle) subtracted
--         *  from the negotiated MTU to get usable Write-Without-Response
--         *  payload. */
-+         *  from the negotiated MTU to get usable ATT write payload bytes. */
-         private const val ATT_HEADER_BYTES = 3
-         /** Hard deadline for a `requestMtu` → `onMtuChanged` round-trip,
-          *  in milliseconds. Some Android BLE stacks are known to accept
-@@ -177,8 +191,8 @@ internal class CentralGattClient(
-          *  and short enough that a hung link surfaces quickly. If the
-          *  deadline passes, the watchdog resumes the handshake with
-          *  whatever MTU the controller auto-negotiated, and the Rust
--         *  transport falls back to its 185-byte fragment floor for that
--         *  peer. */
-+         *  transport falls back to its default ATT payload floor until
-+         *  negotiation completes. */
-         private const val MTU_WATCHDOG_MS = 3000L
-     }
- 
-@@ -400,6 +414,10 @@ internal class CentralGattClient(
-             mainHandler.postDelayed(watchdog, MTU_WATCHDOG_MS)
- 
-             try {
-+                Log.i(
-+                    "BLE_MTU",
-+                    "requestMtu(${REQUESTED_ATT_MTU}) addr=$address",
-+                )
-                 val mtuRequested = gatt.requestMtu(REQUESTED_ATT_MTU)
-                 if (!mtuRequested) {
-                     Log.w(TAG, "requestMtu returned false for $address; continuing with default MTU")
-@@ -434,8 +452,8 @@ internal class CentralGattClient(
-                 // BleTransportFacade.onPeerMtuNegotiated, which stages the
-                 // payload and, if the device id has already been resolved
-                 // for this address, calls flushPeerMtu immediately.
--                // Dropping the value here would pin this link to the
--                // 185-byte floor for its remaining lifetime.
-+                // Dropping the value here would pin this link to Rust's
-+                // pre-MTU fragment floor for its remaining lifetime.
-                 //
-                 // Gate the forward on the gatt client still being
-                 // registered for this address: if teardown has already
-@@ -450,12 +468,17 @@ internal class CentralGattClient(
-                 // moment `closeGattClient` runs.
-                 val stillConnected = host.connections.getGatt(address) != null
-                 if (status == BluetoothGatt.GATT_SUCCESS && stillConnected) {
--                    val maxPayload = (mtu - ATT_HEADER_BYTES).coerceAtLeast(0)
-+                    val rawPayload = (mtu - ATT_HEADER_BYTES).coerceAtLeast(0)
-+                    val maxPayload = rawPayload
-+                    Log.i(
-+                        "BLE_MTU",
-+                        "onMtuChanged(late) addr=$address mtu=$mtu payloadLimit=$maxPayload status=$status",
-+                    )
-                     Log.i(TAG, "Late onMtuChanged for $address after watchdog: mtu=$mtu payload=$maxPayload — forwarding to facade")
-                     diagnosticEmitter(
-                         "info",
-                         "MTU negotiated (late)",
--                        mapOf("address" to address, "mtu" to mtu, "payload" to maxPayload),
-+                        mapOf("address" to address, "mtu" to mtu, "payload" to maxPayload, "rawPayload" to rawPayload),
-                     )
++        return localComparableBleKey() > remoteMac
++    }
++    
++    private fun connectToDevice(device: BluetoothDevice, scanAdvert: MeshAdvertisementData? = null, forceInitiate: Boolean = false) {
+          try {
+              // Atomic check-and-connect to prevent race conditions
+              synchronized(connectionLock) {
+                val remoteMeta = scanAdvert ?: lastSeenMeshAdvertisements[device.address]?.advertisement
+                if (!forceInitiate && !shouldInitiateCentralConnection(remoteMeta, device)) {
+                  if (logThrottler.shouldLog("role_passive_${device.address}", intervalMs = 12_000L)) {
+                    val lStr = java.lang.Long.toUnsignedString(localNodeAdvertForRoleElection().nodeIdHash)
+                    val rStr = remoteMeta?.nodeIdHash?.let { java.lang.Long.toUnsignedString(it) } ?: "none"
+                    Log.i(TAG, "[ROLE] PASSIVE peerHashLo=$rStr localHashLo=$lStr addr=${device.address}")
+                    Log.i(TAG, "[ROLE] CONNECT_SKIPPED_ROLE addr=${device.address}")
+                  }
+                  connections.consumePendingRole(device.address)
+                  return
+                }
+                Log.i(
+                    TAG,
+                    "[ROLE] INITIATOR addr=${device.address} remoteHash=${remoteMeta?.nodeIdHash?.let { java.lang.Long.toUnsignedString(it) } ?: "addr_only_tb"} localHash=${java.lang.Long.toUnsignedString(localNodeAdvertForRoleElection().nodeIdHash)}",
+                )
                      host.onPeerMtuNegotiated(address, maxPayload)
                  } else {
-@@ -465,12 +488,17 @@ internal class CentralGattClient(
+@@ -465,12 +497,18 @@ internal class CentralGattClient(
              }
              mtuWatchdogs.remove(address)?.let { mainHandler.removeCallbacks(it) }
              if (status == BluetoothGatt.GATT_SUCCESS) {
@@ -734,6 +296,7 @@ index a603ce0..e9f6004 100644
 +                    "onMtuChanged addr=$address mtu=$mtu payloadLimit=$maxPayload status=$status",
 +                )
 +                Log.i(TAG, "MTU negotiated for $address: mtu=$mtu payload=$maxPayload (raw=$rawPayload)")
++                Log.i("BLE_LIFECYCLE", "[MTU] READY addr=$address mtu=$mtu payload=$maxPayload")
                  diagnosticEmitter(
                      "info",
                      "MTU negotiated",
@@ -742,15 +305,18 @@ index a603ce0..e9f6004 100644
                  )
                  host.onPeerMtuNegotiated(address, maxPayload)
              } else {
-@@ -582,6 +610,7 @@ internal class CentralGattClient(
+@@ -582,7 +620,10 @@ internal class CentralGattClient(
              // evict and CCCD-ack mutually serialisable on the looper.
              mainHandler.post {
                  if (host.isShuttingDown()) return@post
 +                Log.i("BLE_LINK", "onDescriptorWrite status=$status addr=$address linkReady=true")
                  Log.i(TAG, "CCCD write acknowledged for $address — link ready")
++                Log.i("BLE_LIFECYCLE", "[CCCD] READY addr=$address")
++                Log.i("BLE_LIFECYCLE", "[LINK] READY addr=$address")
                  diagnosticEmitter("info", "BLE link ready", mapOf("address" to address))
                  linkReady.add(address)
-@@ -594,12 +623,10 @@ internal class CentralGattClient(
+                 if (host.isRunning()) {
+@@ -594,12 +635,10 @@ internal class CentralGattClient(
          override fun onCharacteristicWrite(gatt: BluetoothGatt, characteristic: BluetoothGattCharacteristic, status: Int) {
              if (host.isShuttingDown()) return
              if (characteristic.uuid != messageCharUuid) return
@@ -765,15 +331,24 @@ index a603ce0..e9f6004 100644
              }
          }
  
-@@ -687,6 +714,7 @@ internal class CentralGattClient(
+@@ -643,6 +682,7 @@ internal class CentralGattClient(
+ 
+     private fun handleConnected(gatt: BluetoothGatt) {
+         val address = gatt.device.address
++        Log.i("BLE_LIFECYCLE", "[GAP] CONNECTED addr=$address")
+         Log.i(TAG, "GATT client: Connected to $address")
+         diagnosticEmitter("info", "Connected to BLE device", mapOf("address" to address))
+         // Socket is up, so any prior backoff for this address is obsolete.
+@@ -687,6 +727,8 @@ internal class CentralGattClient(
  
      private fun handleDisconnected(gatt: BluetoothGatt, status: Int) {
          val address = gatt.device.address
++        Log.i("BLE_LIFECYCLE", "[GAP] DISCONNECTED addr=$address hciStatus=$status")
 +        host.discardBleOutboundLane(address, requeuePendingFragments = true)
          val wasConnected = host.connections.getGatt(address) != null
          host.connections.removeGatt(address)
          linkReady.remove(address)
-@@ -775,6 +803,7 @@ internal class CentralGattClient(
+@@ -775,6 +817,7 @@ internal class CentralGattClient(
       */
      private fun finalizeGivenUpPeer(address: String, peerId: String) {
          if (host.isShuttingDown()) return
@@ -781,7 +356,23 @@ index a603ce0..e9f6004 100644
          // Cancel any watchdog that may still be in flight for this
          // address — `closeGattClient` usually handles this earlier in
          // the teardown path, but the stale-callback branch in
-@@ -1002,6 +1031,7 @@ internal class CentralGattClient(
+@@ -807,6 +850,7 @@ internal class CentralGattClient(
+             host.refreshAdvertising("disconnect_give_up")
+         }
+         host.maybeHandleRebalance("disconnect_give_up")
++        Log.i(TAG, "[NEIGHBOR] REMOVE peerId=$peerId reason=give_up_ble addr=$address")
+     }
+ 
+     // --- Read handlers (main-thread) ---
+@@ -856,6 +900,7 @@ internal class CentralGattClient(
+ 
+         Log.i(TAG, "Mapping $address -> $deviceIdValue")
+         host.connections.setDeviceIdentifier(address, deviceIdValue)
++        Log.i(TAG, "[DEVICE_ID] RESOLVED addr=$address deviceId=$deviceIdValue")
+ 
+         val role = host.connections.consumePendingRole(address) ?: MeshController.MeshRole.MEMBER
+         host.meshController.registerConnection(deviceIdValue, role)
+@@ -1002,6 +1047,7 @@ internal class CentralGattClient(
  
      private fun closeGattClient(gatt: BluetoothGatt, reason: String) {
          val address = gatt.device.address
@@ -789,6 +380,64 @@ index a603ce0..e9f6004 100644
          try {
              gatt.disconnect()
              gatt.close()
+@@ -1065,18 +1111,41 @@ internal class CentralGattClient(
+      */
+     private fun drainPendingInboundFor(address: String, deviceId: String) {
+         clearResolutionAttempt(address)
++        Log.i(TAG, "[PENDING_DRAIN] START addr=$address deviceId=$deviceId")
+         var iterations = 0
++        var replaySeqInSession = 0
+         while (iterations < MAX_DRAIN_ITERATIONS) {
+             val fragments = host.pendingInbound.drain(address)
+             if (fragments.isEmpty()) break
+             iterations++
++            Log.i(
++                TAG,
++                "[PENDING_DRAIN] BATCH addr=$address deviceId=$deviceId batchIter=$iterations batchCount=${fragments.size}",
++            )
+             for (fragment in fragments) {
+                 try {
++                    replaySeqInSession++
++                    val globalSeq = pendingDrainProtoIngestSeq.incrementAndGet()
++                    Log.i(
++                        TAG,
++                        "[PENDING_DRAIN] REPLAY addr=$address sessionSeq=$replaySeqInSession len=${fragment.size} deviceId=$deviceId",
++                    )
++                    Log.i(
++                        TAG,
++                        "[PROTO_RX] bleFragmentReceived source=pending_drain globalSeq=$globalSeq sessionSeq=$replaySeqInSession sender=$deviceId len=${fragment.size} addr=$address",
++                    )
+                     val bytes = fragment.map { it.toUByte() }
+                     host.protocol.bleFragmentReceived(deviceId, bytes)
++                    try {
++                        host.protocol.process()
++                    } catch (pex: Exception) {
++                        Log.w(TAG, "protocol.process() after pending bleFragmentReceived: ${pex.message}")
++                    }
++                    Log.i(TAG, "Fragment processed successfully for sender: $deviceId (pending_drain sessionSeq=$replaySeqInSession)")
+ 
+                     var msg = host.protocol.receiveMessage()
+                     while (msg != null) {
++                        Log.i(TAG, "COMPLETE MESSAGE ASSEMBLED FROM FRAGMENTS!")
+                         Log.i(TAG, "Complete message assembled from queued fragments for $deviceId")
+                         diagnosticEmitter("info", "Complete message assembled from queued fragments", mapOf(
+                             "senderId" to deviceId,
+@@ -1086,10 +1155,14 @@ internal class CentralGattClient(
+                         msg = host.protocol.receiveMessage()
+                     }
+                 } catch (e: Exception) {
+-                    Log.e(TAG, "Error processing pending fragment", e)
++                    Log.e(TAG, "Error processing pending fragment (sessionSeq=$replaySeqInSession)", e)
+                 }
+             }
+         }
++        Log.i(
++            TAG,
++            "[PENDING_DRAIN] DONE addr=$address deviceId=$deviceId outerIters=$iterations replayCount=$replaySeqInSession",
++        )
+         if (iterations >= MAX_DRAIN_ITERATIONS) {
+             Log.w(TAG, "drainPendingInboundFor hit drain iteration cap for $address")
+             diagnosticEmitter(
 diff --git a/node_modules/@offline-protocol/mesh-sdk/android/src/main/java/com/offlineprotocol/ble/CrisisNetBleDiscovery.kt b/node_modules/@offline-protocol/mesh-sdk/android/src/main/java/com/offlineprotocol/ble/CrisisNetBleDiscovery.kt
 new file mode 100644
 index 0000000..924fe0e
@@ -811,20 +460,41 @@ index 0000000..924fe0e
 +        roleTieU16: Int,
 +    ): ByteArray {
 +        val payload = ByteBuffer
-+            .allocate(10)
++            .allocate(18)
 +            .order(ByteOrder.LITTLE_ENDIAN)
 +
 +        payload.put(0x01) // version
 +
 +        payload.putShort(roleTieU16.toShort())
 +
-+        val copyLen = minOf(meshData.size, 7)
++        val copyLen = minOf(meshData.size, 14)
 +        payload.put(meshData, 0, copyLen)
 +
-+        while (payload.position() < 10) {
++        while (payload.position() < 18) {
 +            payload.put(0)
 +        }
 +
 +        return payload.array()
 +    }
 +}
+
+diff --git a/node_modules/@offline-protocol/mesh-sdk/android/src/main/java/com/offlineprotocol/ble/BleTransportFacade.kt b/node_modules/@offline-protocol/mesh-sdk/android/src/main/java/com/offlineprotocol/ble/BleTransportFacade.kt
+--- a/node_modules/@offline-protocol/mesh-sdk/android/src/main/java/com/offlineprotocol/ble/BleTransportFacade.kt
++++ b/node_modules/@offline-protocol/mesh-sdk/android/src/main/java/com/offlineprotocol/ble/BleTransportFacade.kt
+@@ -2741,6 +2741,15 @@ class BleTransportFacade(
+                     // Proactively attempt to resolve the device ID by initiating a client connection.
+                     // We're already on a caller-controlled thread (usually a binder GATT callback);
+                     // [connectToDevice] is safe to invoke from any thread, so there is no reason to
+-                    // pay an extra main-handler hop here — the old `mainHandler.post` widened the
+-                    // queue-vs-drain race window above.
++                    // pay an extra main-handler hop here — the old `mainHandler.post` widened the
++                    // queue-vs-drain race window above.
++                    // IMPORTANT: forceInitiate=true because we need to resolve this peer's deviceId.
++                    // Role election is bypassed - we must connect to resolve the unknown identity.
+                     bluetoothAdapter?.let { adapter ->
+@@ -2764,7 +2773,7 @@ class BleTransportFacade(
+                                 }
+                                 centralClient.markResolutionAttempt(address, now)
+-                                connectToDevice(device)
++                                connectToDevice(device, forceInitiate = true)
+                             }
