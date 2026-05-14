@@ -59,6 +59,10 @@ const requestAndroidBluetoothPermissions = async () => {
     PermissionsAndroid.PERMISSIONS.ACCESS_FINE_LOCATION,
   ].filter(Boolean);
 
+  if (Platform.Version >= 29) {
+    required.push(PermissionsAndroid.PERMISSIONS.ACCESS_BACKGROUND_LOCATION);
+  }
+
   const result = await PermissionsAndroid.requestMultiple(required);
   const denied = Object.entries(result)
     .filter(([, status]) => status !== PermissionsAndroid.RESULTS.GRANTED)

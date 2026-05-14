@@ -1,3 +1,3 @@
 export const getEmergencyResponse = (prompt) => {
-  return "AI model not available. Please check your internet connection and try again.";
+  return "Local AI model is not currently loaded. Basic survival guidance is available in the Knowledge Base tab. Please ensure the model is downloaded and the app has sufficient memory.";
 };

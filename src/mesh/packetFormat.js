@@ -1,4 +1,4 @@
-import { getDeviceId } from '../storage/deviceId';
+import identity from './core/Identity';
 
 const PACKET_TYPE = {
   MESSAGE: 'msg',
@@ -13,7 +13,7 @@ const createPacketId = () => {
 };
 
 const createMessagePacket = async (content, recipientId = null, priority = 'medium') => {
-  const senderId = await getDeviceId();
+  const senderId = identity.getNodeId();
   const packetId = createPacketId();
   const timestamp = Date.now();
 

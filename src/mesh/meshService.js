@@ -38,7 +38,7 @@ import OfflineProtocol, {
   MessagePriority,
 } from '@offline-protocol/mesh-sdk';
 
-import { getDeviceId } from '../storage/deviceId';
+import identity from './core/Identity';
 import {
   checkBlePermissions,
   requestBlePermissions,
@@ -111,6 +111,26 @@ class MeshService extends EventEmitter {
       });
     }
     return this.peerStates.get(peerId);
+  }
+
+  _getConnectionRole(peerId) {
+    const myId = this.userId || '';
+    if (myId < peerId) {
+      return 'initiator';
+    }
+    return 'acceptor';
+  }
+
+  _shouldSendMessageToPeer(peerId) {
+    const state = this._getPeerState(peerId);
+    if (!state.sessionEstablished || !state.peerRegistered) {
+      return false;
+    }
+    const myRole = this._getConnectionRole(peerId);
+    if (myRole === 'initiator') {
+      return state.linkReady;
+    }
+    return true;
   }
 
   _updatePeerState(peerId, updates) {
@@ -194,8 +214,9 @@ class MeshService extends EventEmitter {
       }
     }
 
-    this.userId = await getDeviceId();
-    this.shortId = this.userId.substring(0, 6);
+    await identity.init();
+    this.userId = identity.getNodeId();
+    this.shortId = this.userId.length > 4 ? this.userId.substring(this.userId.length - 4) : this.userId;
     console.log('[MESH] Device userId:', this.userId, 'shortId:', this.shortId);
 
     // Native mesh identity / neighbor validation uses MLS-backed signing even
@@ -275,7 +296,7 @@ class MeshService extends EventEmitter {
       this.protocolListeners.push({ type, fn });
     };
 
-    subscribe('neighbor_discovered', (event) => {
+    subscribe('neighbor_discovered', async (event) => {
       const peerId = event?.peer_id;
       if (!peerId) return;
       const rssi =
@@ -284,7 +305,6 @@ class MeshService extends EventEmitter {
       peerRegistry.updatePeer(peerId, rssi, { transport: event.transport || 'ble' });
       
       const peerState = this._getPeerState(peerId);
-      peerState.linkReady = true;
       peerState.rssi = rssi;
       
       this.peers.set(peerId, {
@@ -302,11 +322,10 @@ class MeshService extends EventEmitter {
       this._logPeerEvent('HELLO_RX', { 
         peerId, 
         rssi, 
-        transport: event.transport,
-        linkReady: peerState.linkReady 
+        transport: event.transport
       });
 
-      this._establishSessionForPeer(peerId);
+      await this._establishSessionForPeer(peerId);
     });
 
     subscribe('neighbor_lost', (event) => {
@@ -470,6 +489,7 @@ class MeshService extends EventEmitter {
         state.sessionEstablished = true;
         state.peerRegistered = true;
         state.deviceIdResolved = true;
+        state.linkReady = true;
         console.log('[MESH] Session established for peer:', peerId.slice(0, 8));
       }
       logProto('neighbor/session: secure_session_established', event);
@@ -643,15 +663,16 @@ class MeshService extends EventEmitter {
 
     const readyPeers = [];
     for (const [peerId, peer] of this.peers.entries()) {
-      const state = this._getPeerState(peerId);
-      if (state.sessionEstablished && state.peerRegistered) {
+      if (this._shouldSendMessageToPeer(peerId)) {
         readyPeers.push(peerId);
       } else {
+        const state = this._getPeerState(peerId);
         this._logPeerEvent('TX_GATED', { 
           peerId, 
           reason: 'session_not_ready',
           sessionEstablished: state.sessionEstablished,
-          peerRegistered: state.peerRegistered
+          peerRegistered: state.peerRegistered,
+          linkReady: state.linkReady,
         });
       }
     }
@@ -662,20 +683,15 @@ class MeshService extends EventEmitter {
       return { id: messageId, queued: true };
     }
 
-    const sendOps = [];
     for (const peerId of readyPeers) {
-      sendOps.push(
-        this.protocol
-          .sendMessage({ recipient: peerId, content, priority })
-          .then(() => {
-            this._logPeerEvent('MESSAGE_DELIVERED', { peerId, messageId, recipientCount: readyPeers.length });
-          })
-          .catch((e) => {
-            console.warn('[MESH] send to', peerId, 'failed:', e?.message || e);
-          }),
-      );
+      try {
+        await this.protocol.sendMessage({ recipient: peerId, content, priority });
+        this._logPeerEvent('MESSAGE_DELIVERED', { peerId, messageId, recipientCount: readyPeers.length });
+      } catch (e) {
+        console.warn('[MESH] send to', peerId, 'failed:', e?.message || e);
+      }
+      await new Promise(resolve => setTimeout(resolve, 50));
     }
-    await Promise.all(sendOps);
     return { id: messageId, recipients: readyPeers.length };
   }
 

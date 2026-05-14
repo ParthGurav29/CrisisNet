@@ -44,12 +44,34 @@ export const MeshProvider = ({ children }) => {
         peerRegistered: false,
         deviceIdResolved: false,
         sessionEstablished: false,
-        linkReady: true,
+        linkReady: false,
       };
       return [...prev, {
         ...peer,
         peerState,
       }];
+    });
+  }, []);
+
+  const handlePeerUpdated = useCallback((peer) => {
+    setNodes((prev) => {
+      const index = prev.findIndex(n => n.id === peer.id);
+      if (index === -1) return [...prev, {
+        id: peer.id,
+        name: typeof peer.id === 'string' && peer.id.length > 4 ? peer.id.substring(peer.id.length - 4) : peer.id,
+        transport: peer.capabilities?.transport || 'ble',
+        rssi: peer.rssi,
+        peerState: peer.peerState,
+      }];
+      
+      const updated = [...prev];
+      updated[index] = {
+        ...updated[index],
+        rssi: peer.rssi,
+        peerState: peer.peerState || updated[index].peerState,
+        capabilities: { ...updated[index].capabilities, ...peer.capabilities },
+      };
+      return updated;
     });
   }, []);
 
@@ -230,6 +252,7 @@ export const MeshProvider = ({ children }) => {
     listenersInitializedRef.current = true;
 
     meshService.on('peer_discovered', handlePeerDiscovered);
+    meshService.on('peer_updated', handlePeerUpdated);
     meshService.on('peer_lost', handlePeerLost);
     meshService.on('message_received', handleMessageReceived);
     meshService.on('started', handleStarted);
@@ -250,19 +273,30 @@ export const MeshProvider = ({ children }) => {
       if (!peer?.id) return;
       handlePeerDiscovered({
         id: peer.id,
-        name: typeof peer.id === 'string' && peer.id.length > 6 ? peer.id.substring(0, 6) : peer.id,
+        name: typeof peer.id === 'string' && peer.id.length > 4 ? peer.id.substring(peer.id.length - 4) : peer.id,
         transport: peer.capabilities?.transport || 'ble',
         peerState: peer.peerState,
+        rssi: peer.rssi,
+      });
+    });
+    meshEvents.on('peer_updated', (peer) => {
+      if (!peer?.id) return;
+      handlePeerUpdated({
+        id: peer.id,
+        rssi: peer.rssi,
+        peerState: peer.peerState,
+        capabilities: peer.capabilities,
       });
     });
     meshEvents.on('peer_lost', (peer) => {
       handlePeerLost({ id: peer.peerId });
     });
-  }, [handlePeerDiscovered, handlePeerLost, handleMessageReceived, handleStarted, handleStopped, handleScanning, handleAdvertising]);
+  }, [handlePeerDiscovered, handlePeerUpdated, handlePeerLost, handleMessageReceived, handleStarted, handleStopped, handleScanning, handleAdvertising]);
 
   const cleanupListeners = useCallback(() => {
     listenersInitializedRef.current = false;
     meshService.off('peer_discovered', handlePeerDiscovered);
+    meshService.off('peer_updated', handlePeerUpdated);
     meshService.off('peer_lost', handlePeerLost);
     meshService.off('message_received', handleMessageReceived);
     meshService.off('started', handleStarted);
@@ -273,9 +307,10 @@ export const MeshProvider = ({ children }) => {
     try {
       const { default: meshEvents } = require('../mesh/core/MeshEvents');
       meshEvents.removeAllListeners('peer_discovered');
+      meshEvents.removeAllListeners('peer_updated');
       meshEvents.removeAllListeners('peer_lost');
     } catch (e) {}
-  }, [handlePeerDiscovered, handlePeerLost, handleMessageReceived, handleStarted, handleStopped, handleScanning, handleAdvertising]);
+  }, [handlePeerDiscovered, handlePeerUpdated, handlePeerLost, handleMessageReceived, handleStarted, handleStopped, handleScanning, handleAdvertising]);
 
   useEffect(() => {
     isMountedRef.current = true;

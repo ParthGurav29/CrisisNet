@@ -36,11 +36,19 @@ const createSha256Hasher = () => {
   };
 };
 
-const HF_TOKEN = 'UR_TOKEN';
+const HF_TOKEN = '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';
 
 
-export const MODEL_FILENAME = 'gemma-4-E2B-it-Q4_K_M.gguf';
-export const MODEL_ID = 'gemma';
+export const MODEL_FILENAME =
+  'crisisnet-gemma-final.Q4_K_M.gguf';
+
+export const MODEL_ID = 'crisisnet-gemma';
+
+const MODEL_URL =
+  'https://huggingface.co/Prime23457890/crisisnet-gemma-gguf/resolve/main/crisisnet-gemma-final.Q4_K_M.gguf';
+
+export const MODEL_EXPECTED_SIZE = 1708582528;
+
 const MODEL_ROOT_DIR = `${RNFS.DocumentDirectoryPath}/models`;
 const MODEL_DIR = `${MODEL_ROOT_DIR}/${MODEL_ID}`;
 const MODEL_PATH = `${MODEL_DIR}/${MODEL_FILENAME}`;
@@ -54,9 +62,6 @@ const ACK_DEDUPE_KEY = 'ack_dedupe';
 const SYSTEM_STATE_KEY = 'system_state';
 const RETRY_BUDGET_KEY = 'retry_budget';
 const MODEL_LIFECYCLE_KEY = 'model_lifecycle_state';
-const MODEL_URL =
-  'https://huggingface.co/unsloth/gemma-4-E2B-it-GGUF/resolve/main/gemma-4-E2B-it-Q4_K_M.gguf';
-export const MODEL_EXPECTED_SIZE = 2800 * 1024 * 1024;
 const MIN_VALID_MODEL_BYTES = MODEL_EXPECTED_SIZE * 0.5;
 
 export const EXPECTED_SHA256 = null;
@@ -274,7 +279,14 @@ export const saveResumeOffset = async (bytesWritten, totalBytes) => {
   }
 };
 
-export const getModelPath = () => MODEL_PATH;
+export const getModelPath = () => {
+  const path = MODEL_PATH;
+  console.log('[DEBUG-STORAGE] getModelPath called, returning:', path);
+  console.log('[DEBUG-STORAGE] MODEL_ROOT_DIR:', MODEL_ROOT_DIR);
+  console.log('[DEBUG-STORAGE] MODEL_DIR:', MODEL_DIR);
+  console.log('[DEBUG-STORAGE] MODEL_FILENAME:', MODEL_FILENAME);
+  return path;
+};
 
 export const getModelDir = () => MODEL_DIR;
 export const getModelRootDir = () => MODEL_ROOT_DIR;
@@ -457,20 +469,26 @@ export const checkAndResumeDownload = async () => {
 
 export const modelExists = async () => {
   try {
+    console.log('[DEBUG-STORAGE] modelExists: Starting check...');
     const exists = await RNFS.exists(MODEL_PATH);
+    console.log('[DEBUG-STORAGE] modelExists check for:', MODEL_PATH, 'Result:', exists);
     if (!exists) {
       await setModelLifecycleState(MODEL_LIFECYCLE_STATES.NOT_DOWNLOADED);
       return false;
     }
     const stat = await RNFS.stat(MODEL_PATH);
     const bytes = parseInt(stat.size, 10);
+    console.log('[DEBUG-STORAGE] Model file size:', bytes, 'bytes');
     if (bytes < MIN_VALID_MODEL_BYTES) {
+      console.warn('[DEBUG-STORAGE] File too small:', bytes, '<', MIN_VALID_MODEL_BYTES);
       await setModelLifecycleState(MODEL_LIFECYCLE_STATES.NOT_DOWNLOADED, { reason: 'file_too_small' });
       return false;
     }
 
     const meta = await getModelMeta();
+    console.log('[DEBUG-STORAGE] Model meta:', meta);
     if (!meta || meta.version !== MODEL_VERSION || !meta.completed) {
+      console.log('[DEBUG-STORAGE] Meta missing or incomplete, saving new meta');
       await saveModelMeta({
         hash: null,
         size: bytes,
@@ -483,6 +501,7 @@ export const modelExists = async () => {
     }
 
     const checksumResult = await validateModelChecksum({ quick: true });
+    console.log('[DEBUG-STORAGE] Checksum result:', checksumResult);
     await setModelLifecycleState(
       checksumResult.valid ? MODEL_LIFECYCLE_STATES.READY_ON_DISK : MODEL_LIFECYCLE_STATES.FAILED,
       checksumResult.valid ? {} : { reason: checksumResult.reason || 'checksum_failed' },

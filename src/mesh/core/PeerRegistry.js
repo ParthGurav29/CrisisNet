@@ -41,12 +41,13 @@ class PeerRegistry {
           peerRegistered: false,
           deviceIdResolved: false,
           sessionEstablished: false,
-          linkReady: true,
+          linkReady: false,
           lastHelloTimestamp: now,
           lastPacketTimestamp: 0,
           lastDecodeFailure: null,
           pendingInboundFragments: 0,
           pendingOutboundFragments: 0,
+          connectionInitiator: null,
         },
       };
       this.peers.set(peerId, peer);

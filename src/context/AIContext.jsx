@@ -82,14 +82,18 @@ export const AIProvider = ({ children }) => {
         }
         
         const modelFileExists = await modelExists();
+        console.log('[AIContext] modelExists result:', modelFileExists);
         if (modelFileExists) {
           const loaded = gemmaIsModelLoaded();
+          console.log('[AIContext] gemmaIsModelLoaded:', loaded);
           if (isMounted) {
             setIsModelLoaded(loaded);
-            setModelStatus(loaded ? 'ready' : 'download');
-            setAIState(loaded ? AIState.READY : AIState.FALLBACK);
+            setModelStatus(loaded ? 'ready' : 'loading');
+            setAIState(loaded ? AIState.READY : AIState.LOADING);
+            console.log('[AIContext] Setting state to:', loaded ? 'READY' : 'LOADING');
           }
         } else {
+          console.log('[AIContext] Model file does not exist on disk');
           if (isMounted) {
             setIsModelLoaded(false);
             setModelStatus('download');
@@ -186,6 +190,7 @@ export const AIProvider = ({ children }) => {
     if (aiState === AIState.ERROR) return `AI Error: ${aiError || 'Unknown error'}`;
     if (aiState === AIState.NOT_SUPPORTED) return `Device not supported: ${aiError || ''}`;
     if (aiState === AIState.IDLE && modelStatus === 'download') return 'Model not downloaded';
+    if (aiState === AIState.IDLE) return 'Ready to load model';
     return 'Loading AI model...';
   };
 

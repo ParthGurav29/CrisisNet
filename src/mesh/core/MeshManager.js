@@ -76,17 +76,18 @@ class MeshManager {
       const nodeId = identity.getNodeId();
       
       peerRegistry.start();
+      
       if (capabilities.sdkOwnsBleTransport) {
         meshLogger.info(
           'manager',
-          'BLE scan/advertise/GATT run inside mesh-sdk after meshService.protocol.start(); skipping JS duty scanner',
+          'BLE scan/advertise/GATT run inside mesh-sdk after meshService.init(); skipping JS duty cycles',
         );
-      }
-      await bleAdvertiser.start(nodeId);
-      if (!capabilities.sdkOwnsBleTransport) {
+      } else {
+        await bleAdvertiser.start(nodeId);
         await bleScanner.start();
+        await gattServer.start();
       }
-      await gattServer.start();
+      
       heartbeat.start();
       
       this.discoveryActive = true;
