@@ -1,7 +1,7 @@
 import meshEvents from './MeshEvents';
 import meshLogger from './MeshLogger';
 
-const PEER_TIMEOUT_MS = 30000;
+const PEER_TIMEOUT_MS = 60000;
 const CLEANUP_INTERVAL_MS = 5000;
 const RSSI_SMOOTHING_FACTOR = 3;
 
@@ -112,6 +112,24 @@ class PeerRegistry {
       return peer.peerState;
     }
     return null;
+  }
+
+  updateLastSeen(peerId) {
+    const peer = this.peers.get(peerId);
+    if (peer) {
+      peer.lastSeen = Date.now();
+      return true;
+    }
+    return false;
+  }
+
+  updateLastSeenOnFragment(peerId) {
+    const peer = this.peers.get(peerId);
+    if (peer) {
+      peer.lastSeen = Date.now();
+      return true;
+    }
+    return false;
   }
 }
 

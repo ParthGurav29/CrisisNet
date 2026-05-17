@@ -1,10 +1,11 @@
 import React, { createContext, useState, useEffect, useCallback, useRef } from 'react';
-import { AppState, Alert, View, Text } from 'react-native';
+import { AppState, Alert, View, Text, Linking } from 'react-native';
 import meshService from '../mesh/meshService';
 import { getMessages, saveMessage, cleanupMessages } from '../storage/messages';
 import db from '../storage/db';
 import { getShortId } from '../storage/deviceId';
 import { createMessagePacket, PACKET_TYPE } from '../mesh/packetFormat';
+import { openPermissionSettings } from '../utils/permissions';
 
 // Mesh state machine types
 const MeshState = {
@@ -26,6 +27,8 @@ export const MeshProvider = ({ children }) => {
   const [lastMessageTime, setLastMessageTime] = useState(null);
   const [meshError, setMeshError] = useState(false);
   const [meshState, setMeshState] = useState(MeshState.IDLE);
+  const [permissionError, setPermissionError] = useState(null);
+  const [permissionErrorType, setPermissionErrorType] = useState(null);
   const appStateRef = useRef(AppState.currentState);
   const isMountedRef = useRef(true);
   const listenersInitializedRef = useRef(false);
@@ -82,14 +85,22 @@ export const MeshProvider = ({ children }) => {
     setNodes((prev) => prev.filter(n => n.id !== peer.id));
   }, []);
 
+  const INTERNAL_TYPES = ['heartbeat', 'heartbeat_ack', 'ack', 'nack', 'delivery_receipt', 'peer_sync', 'control', 'session'];
+  const UI_TYPES = ['chat', 'message', 'msg', 'sos', 'notice', 'triage', 'resource_pin', 'emergency'];
+
   const handleMessageReceived = useCallback(async (event) => {
     setLastMessageTime(Date.now());
     let payload;
     try {
-      payload = event.content ? JSON.parse(event.content) : {};
+      payload = typeof event.content === 'string' ? JSON.parse(event.content) : (event.content || {});
     } catch (e) {
-      payload = { text: event.content || 'Unknown message' };
+      return;
     }
+
+    if (!payload || typeof payload !== 'object') return;
+    if (!payload.type || typeof payload.type !== 'string') return;
+    if (INTERNAL_TYPES.includes(payload.type)) return;
+    if (!UI_TYPES.includes(payload.type)) return;
 
     let messageType = 'chat';
     let text = '';
@@ -109,17 +120,23 @@ export const MeshProvider = ({ children }) => {
       } else if (typeof payload.content === 'string') {
         text = payload.content;
       } else {
-        text = payload.text || payload.desc || 'Unknown message';
+        text = payload.text || payload.desc || '';
       }
     } else if (payload.type === 'emergency') {
       messageType = 'emergency';
       text = payload.desc || payload.text || 'Emergency Alert';
       triage = payload.triage || 'YELLOW';
-    } else {
-      text = payload.text || (typeof payload === 'string' ? payload : 'Unknown message');
+    } else if (payload.type === 'chat' || payload.type === 'msg' || payload.type === 'message') {
+      messageType = payload.type === 'msg' ? 'chat' : payload.type;
+      text = payload.text || payload.content || '';
+    } else if (payload.type === 'sos' || payload.type === 'notice' || payload.type === 'triage' || payload.type === 'resource_pin') {
+      text = payload.text || payload.content || payload.desc || '';
     }
 
-    const rawSenderId = event.senderId || event.sender || 'Unknown';
+    if (!text) return;
+
+    const rawSenderId = event.senderId || event.sender || null;
+    if (!rawSenderId) return;
     const senderShortId = rawSenderId.length > 6 ? rawSenderId.substring(0, 6) : rawSenderId;
 
     const newMessage = {
@@ -177,10 +194,6 @@ export const MeshProvider = ({ children }) => {
   }, []);
 
   const initMesh = useCallback(async () => {
-    // Guard: only the first call from useEffect should run init.
-    // Subsequent retries must go through `restartMesh` (the user-initiated
-    // path) so a transient failure doesn't enter an init -> FAILED -> init
-    // loop on devices/emulators without Bluetooth.
     if (initInFlightRef.current || initAttemptedRef.current) return;
     initInFlightRef.current = true;
     initAttemptedRef.current = true;
@@ -210,9 +223,25 @@ export const MeshProvider = ({ children }) => {
       meshService.flushQueue();
     } catch (e) {
       console.error('[MeshContext] Init failed:', e?.message || e);
+      const errorMsg = e?.message || '';
+      const permissionMatch = errorMsg.match(/Permission denied:\s*(.+)/i);
+      const permissionType = permissionMatch ? permissionMatch[1].toLowerCase().replace(/ /g, '_') : 'unknown';
+      
+      meshService.emit('permissions_required', {
+        permission: permissionType,
+        message: permissionMatch 
+          ? `Permission required: ${permissionMatch[1]}` 
+          : 'Background location required for mesh networking',
+        permissionType: permissionType
+      });
+      
       if (isMountedRef.current) {
         setMeshError(true);
         setMeshState(MeshState.FAILED);
+        setPermissionErrorType(permissionType);
+        setPermissionError(permissionMatch 
+          ? `Permission required: ${permissionMatch[1]}` 
+          : 'Background location required for mesh networking');
       }
     } finally {
       initInFlightRef.current = false;
@@ -269,6 +298,20 @@ export const MeshProvider = ({ children }) => {
     
     meshService.on('message_failed', (event) => {
       console.warn('[MESH][UI] message_failed', event);
+    });
+
+    meshService.on('error', (event) => {
+      console.warn('[MESH][UI] error event', event);
+    });
+
+    meshService.on('permissions_required', ({ permission, message }) => {
+      console.log('[MESH][UI] permissions_required', { permission, message });
+      setPermissionError(message || `Permission required: ${permission}`);
+      setPermissionErrorType(permission);
+      if (isMountedRef.current) {
+        setMeshError(true);
+        setMeshState(MeshState.FAILED);
+      }
     });
     
     const { default: meshEvents } = require('../mesh/core/MeshEvents');
@@ -486,7 +529,22 @@ export const MeshProvider = ({ children }) => {
 
   return (
     <>
-      {meshError && (
+      {permissionError && (
+        <View style={{ backgroundColor: '#ff3b5c', padding: 10, alignItems: 'center' }}>
+          <Text style={{ color: '#ffffff', fontSize: 12, fontWeight: '600' }}>
+            {permissionErrorType === 'background_location' || permissionErrorType === 'background_location_permission'
+              ? 'Background location required for mesh networking'
+              : permissionError}
+          </Text>
+          <Text 
+            style={{ color: '#ffffff', fontSize: 10, textDecorationLine: 'underline' }}
+            onPress={() => openPermissionSettings()}
+          >
+            Tap to open settings
+          </Text>
+        </View>
+      )}
+      {meshError && !permissionError && (
         <View style={{ backgroundColor: '#ff3b5c', padding: 10, alignItems: 'center' }}>
           <Text style={{ color: '#ffffff', fontSize: 12, fontWeight: '600' }}>
             Mesh unavailable — check Bluetooth permissions

@@ -6,6 +6,16 @@ const RETRY_DELAY_MS = 100;
 const sleep = (ms) => new Promise(resolve => setTimeout(resolve, ms));
 
 export const saveMessage = async (message, retryCount = 0) => {
+  const SAVEABLE_TYPES = ['chat', 'message', 'msg', 'sos', 'notice', 'triage', 'resource_pin', 'emergency'];
+  if (!message || typeof message !== 'object') {
+    return null;
+  }
+  if (!message.type || !SAVEABLE_TYPES.includes(message.type)) {
+    return null;
+  }
+  if (!message.text && !message.content) {
+    return null;
+  }
   const db = await initDB();
   return new Promise((resolve, reject) => {
     db.transaction((tx) => {

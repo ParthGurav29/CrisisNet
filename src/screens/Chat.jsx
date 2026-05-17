@@ -40,6 +40,8 @@ export default function ChatScreen() {
   };
 
   const renderMessage = ({ item }) => {
+    if (!item || !item.type || !item.text) return null;
+    const senderName = item.sender || item.sender_id || 'Unknown';
     const isMe = item.sender === displayShortId || item.sender_id === displayShortId || item.sender === myShortId;
     const isEmergency = item.type === 'emergency';
     const triageColor = getTriageColor(item.triage);
@@ -52,7 +54,7 @@ export default function ChatScreen() {
       ]}>
         {!isMe && (
           <View style={styles.senderRow}>
-            <Text style={styles.sender}>{item.sender}</Text>
+            <Text style={styles.sender}>{senderName}</Text>
             {isEmergency && (
               <View style={[styles.emergencyBadge, { backgroundColor: triageColor + '33' }]}>
                 <Text style={[styles.emergencyBadgeText, { color: triageColor }]}>
@@ -68,7 +70,7 @@ export default function ChatScreen() {
           <Text style={styles.messageText}>{item.text}</Text>
         )}
         <Text style={styles.time}>
-          {new Date(item.timestamp).toLocaleTimeString([], { hour: '2-digit', minute: '2-digit' })}
+          {item.timestamp ? new Date(item.timestamp).toLocaleTimeString([], { hour: '2-digit', minute: '2-digit' }) : ''}
         </Text>
       </View>
     );

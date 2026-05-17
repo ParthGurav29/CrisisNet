@@ -1,4 +1,4 @@
-import { Platform, PermissionsAndroid, NativeModules, Alert } from 'react-native';
+import { Platform, PermissionsAndroid, NativeModules, Alert, Linking } from 'react-native';
 
 export const PERMISSIONS = {
   BLUETOOTH_CONNECT: 'android.permission.BLUETOOTH_CONNECT',
@@ -52,54 +52,97 @@ export const checkBlePermissions = async () => {
 };
 
 const requestAndroidBluetoothPermissions = async () => {
-  if (Platform.Version <= 30) {
-    const shouldShowRationale = await PermissionsAndroid.shouldShowRequestPermissionRationale(
-      PermissionsAndroid.PERMISSIONS.ACCESS_BACKGROUND_LOCATION
-    );
-    if (shouldShowRationale) {
-      await new Promise((resolve) => {
-        Alert.alert(
-          'Background Location Required',
-          'ACCESS_BACKGROUND_LOCATION is needed for offline mesh networking to discover and connect to nearby peers.',
-          [{ text: 'OK', onPress: resolve }]
-        );
-      });
-    }
-    const bgLocationResult = await PermissionsAndroid.request(
-      PermissionsAndroid.PERMISSIONS.ACCESS_BACKGROUND_LOCATION,
-      {
-        title: 'Background Location Permission',
-        message: 'ACCESS_BACKGROUND_LOCATION is needed for offline mesh networking to discover and connect to nearby peers.',
-        buttonNeutral: 'Ask Me Later',
-        buttonNegative: 'Deny',
-        buttonPositive: 'Grant',
-      }
-    );
-    if (bgLocationResult !== PermissionsAndroid.RESULTS.GRANTED) {
-      return {
-        granted: false,
-        denied: [PermissionsAndroid.PERMISSIONS.ACCESS_BACKGROUND_LOCATION],
-      };
-    }
-  }
+  const apiLevel = Platform.Version;
 
-  const required = [
+  const foregroundRequired = [
     PermissionsAndroid.PERMISSIONS.BLUETOOTH_SCAN,
     PermissionsAndroid.PERMISSIONS.BLUETOOTH_CONNECT,
     PermissionsAndroid.PERMISSIONS.BLUETOOTH_ADVERTISE,
     PermissionsAndroid.PERMISSIONS.ACCESS_FINE_LOCATION,
   ].filter(Boolean);
 
-  if (Platform.Version > 30) {
-    required.push(PermissionsAndroid.PERMISSIONS.ACCESS_BACKGROUND_LOCATION);
-  }
-
-  const result = await PermissionsAndroid.requestMultiple(required);
-  const denied = Object.entries(result)
+  const foregroundResult = await PermissionsAndroid.requestMultiple(foregroundRequired);
+  const deniedForeground = Object.entries(foregroundResult)
     .filter(([, status]) => status !== PermissionsAndroid.RESULTS.GRANTED)
     .map(([perm]) => perm);
 
-  return { granted: denied.length === 0, denied };
+  if (deniedForeground.length > 0) {
+    return { granted: false, denied: deniedForeground, openSettings: true };
+  }
+
+  if (apiLevel >= 29 && apiLevel <= 30) {
+    const grantedFg = Object.values(foregroundResult).every(
+      (s) => s === PermissionsAndroid.RESULTS.GRANTED
+    );
+    if (!grantedFg) {
+      return { granted: false, denied: ['foreground'], openSettings: true };
+    }
+
+    await new Promise((resolve) => {
+      Alert.alert(
+        'Background Location Required',
+        'CrisisNet needs background location to keep the mesh network active when the screen turns off. Please select Allow all the time on the next screen.',
+        [{ text: 'OK', onPress: resolve }]
+      );
+    });
+    
+    const bgLocationResult = await PermissionsAndroid.request(
+      PermissionsAndroid.PERMISSIONS.ACCESS_BACKGROUND_LOCATION,
+      {
+        title: 'Background Location Permission',
+        message: 'CrisisNet needs background location to keep the mesh network active when the screen turns off. Please select Allow all the time on the next screen.',
+        buttonNeutral: 'Ask Me Later',
+        buttonNegative: 'Deny',
+        buttonPositive: 'Grant',
+      }
+    );
+    
+    if (bgLocationResult !== PermissionsAndroid.RESULTS.GRANTED) {
+      return {
+        granted: false,
+        denied: [PermissionsAndroid.PERMISSIONS.ACCESS_BACKGROUND_LOCATION],
+        openSettings: true,
+        permission: 'background_location',
+      };
+    }
+  } else if (apiLevel > 30) {
+    const grantedFg = Object.values(foregroundResult).every(
+      (s) => s === PermissionsAndroid.RESULTS.GRANTED
+    );
+    if (!grantedFg) {
+      return { granted: false, denied: ['foreground'], openSettings: true };
+    }
+
+    await new Promise((resolve) => {
+      Alert.alert(
+        'Background Location Required',
+        'CrisisNet needs background location to keep the mesh network active when the screen turns off. Please select Allow all the time on the next screen.',
+        [{ text: 'OK', onPress: resolve }]
+      );
+    });
+
+    const bgLocationResult = await PermissionsAndroid.request(
+      PermissionsAndroid.PERMISSIONS.ACCESS_BACKGROUND_LOCATION,
+      {
+        title: 'Background Location Permission',
+        message: 'CrisisNet needs background location to keep the mesh network active when the screen turns off. Please select Allow all the time on the next screen.',
+        buttonNeutral: 'Ask Me Later',
+        buttonNegative: 'Deny',
+        buttonPositive: 'Grant',
+      }
+    );
+    
+    if (bgLocationResult !== PermissionsAndroid.RESULTS.GRANTED) {
+      return {
+        granted: false,
+        denied: [PermissionsAndroid.PERMISSIONS.ACCESS_BACKGROUND_LOCATION],
+        openSettings: true,
+        permission: 'background_location',
+      };
+    }
+  }
+
+  return { granted: true, denied: [] };
 };
 
 export const requestBlePermissions = async () => {
@@ -111,6 +154,7 @@ export const requestBlePermissions = async () => {
       return {
         granted: false,
         reason: `Permissions denied: ${permResult.denied.join(', ')}`,
+        openSettings: permResult.openSettings,
       };
     }
 
@@ -125,6 +169,14 @@ export const requestBlePermissions = async () => {
     return { granted: true, enabled: true };
   } catch (e) {
     return { granted: false, reason: e?.message || 'Bluetooth setup failed' };
+  }
+};
+
+export const openPermissionSettings = async () => {
+  try {
+    await Linking.openSettings();
+  } catch (e) {
+    console.warn('[PERMS] Failed to open settings:', e?.message);
   }
 };
 

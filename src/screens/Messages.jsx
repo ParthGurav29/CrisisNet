@@ -56,6 +56,7 @@ export default function MessagesScreen() {
   };
 
   const renderItem = ({ item }) => {
+    if (!item || !item.type) return null;
     const isEmergency = item.type === 'emergency';
     const triageColor = getTriageColor(item.triage);
 
@@ -69,7 +70,7 @@ export default function MessagesScreen() {
           <Text style={styles.timestamp}>{formatTime(item.timestamp)}</Text>
         </View>
         <Text style={[styles.messageText, isEmergency && { color: triageColor }]}>
-          {item.text || item.content || 'Message'}
+          {item.text || (item.content && typeof item.content === 'string' ? item.content : '')}
         </Text>
         {isEmergency && item.triage && (
           <View style={[styles.triageBadge, { backgroundColor: triageColor + '33' }]}>

@@ -60,12 +60,14 @@ import peerRegistry from './core/PeerRegistry';
 import { CRISISNET_MESH_SERVICE_UUID } from './core/crisisNetBleConstants';
 
 const DEBOUNCE_MS = 500;
-const MAX_QUEUE_SIZE = 100;
+const MAX_QUEUE_SIZE = 500;
 const MAX_SEEN_MESSAGES = 1000;
 const APP_ID = 'com.crisisnet';
 const BROADCAST_RECIPIENT = '__broadcast__';
-const PEER_STALE_TIMEOUT_MS = 30000;
-const PEER_CLEANUP_INTERVAL_MS = 10000; // synthetic marker, never sent as recipient
+const PEER_STALE_TIMEOUT_MS = 60000;
+const PEER_CLEANUP_INTERVAL_MS = 10000;
+const GATT_RECONNECT_DELAY_MS = 700;
+const MIN_GATT_INTERVAL_MS = 700;
 
 class MeshService extends EventEmitter {
   constructor() {
@@ -101,6 +103,10 @@ class MeshService extends EventEmitter {
     this.sessionEstablishedCount = 0;
     this.wakeLockAcquired = false;
     this.appStateListener = null;
+    this.sessionRecoveryTimers = new Map();
+    this.exhaustionRecoveryCount = new Map();
+    this.lastConnectTimestamp = 0;
+    this.gattCloseTimers = new Map();
   }
 
   _getWakeLockModule() {
@@ -175,6 +181,7 @@ class MeshService extends EventEmitter {
         pendingInboundFragments: 0,
         pendingOutboundFragments: 0,
         missedHeartbeats: 0,
+        sessionExhaustionCount: 0,
       });
     }
     return this.peerStates.get(peerId);
@@ -361,6 +368,8 @@ class MeshService extends EventEmitter {
       
       const peerState = this._getPeerState(peerId);
       peerState.rssi = rssi;
+      peerState.linkReady = true;
+      peerState.peerRegistered = true;
       
       this.peers.set(peerId, {
         id: peerId,
@@ -409,6 +418,7 @@ class MeshService extends EventEmitter {
             peer.lastSeenMs = Date.now();
           }
         });
+        peerRegistry.updateLastSeen(peerId);
       }
 
       const content = event.content || '';
@@ -419,26 +429,57 @@ class MeshService extends EventEmitter {
         packet = null;
       }
 
+      const INTERNAL_TYPES = ['heartbeat', 'heartbeat_ack', 'ack', 'nack', 'ping', 'pong',
+        'delivery_receipt', 'peer_sync', 'control', 'session'];
+      const UI_TYPES = ['chat', 'message', 'msg', 'sos', 'notice', 'triage', 'resource_pin', 'emergency'];
+
+      if (!packet || typeof packet !== 'object') {
+        console.log('[MESH] Dropped invalid packet: not a valid object');
+        return;
+      }
+
+      if (!packet.type || typeof packet.type !== 'string') {
+        console.log('[MESH] Dropped packet with missing or invalid type');
+        return;
+      }
+
+      if (INTERNAL_TYPES.includes(packet.type)) {
+        if (packet.type === PACKET_TYPE.ACK) {
+          console.log('[MESH][E2E] ack_received', {
+            originalId: packet.originalId,
+            sender: event.sender,
+            contentBytes: typeof content === 'string' ? content.length : 0,
+          });
+          this._handleAck(packet);
+        } else if (packet.type === PACKET_TYPE.HEARTBEAT) {
+          const senderId = packet.sender;
+          if (senderId) {
+            this._handleHeartbeatResponse(senderId);
+            peerRegistry.updateLastSeen(senderId);
+            await this._sendHeartbeatResponse(senderId);
+          }
+        } else if (packet.type === PACKET_TYPE.HEARTBEAT_ACK) {
+          const senderId = packet.sender;
+          if (senderId) {
+            this._handleHeartbeatResponse(senderId);
+            peerRegistry.updateLastSeen(senderId);
+          }
+        }
+        return;
+      }
+
+      if (!UI_TYPES.includes(packet.type)) {
+        console.log(`[MESH] Dropped unrecognized packet type: ${packet.type}`);
+        return;
+      }
+
       if (packet && peerId) {
         const state = this._getPeerState(peerId);
         state.lastPacketTimestamp = Date.now();
         state.missedHeartbeats = 0;
-        if (!packet.type) {
-          state.lastDecodeFailure = 'missing packet type';
-        }
       }
 
-      if (packet && packet.type === PACKET_TYPE.ACK) {
-        console.log('[MESH][E2E] ack_received', {
-          originalId: packet.originalId,
-          sender: event.sender,
-          contentBytes: typeof content === 'string' ? content.length : 0,
-        });
-        this._handleAck(packet);
-        return;
-      }
-
-      if (packet && packet.type === PACKET_TYPE.MESSAGE) {
+      if (packet.type === PACKET_TYPE.MESSAGE) {
         if (isDuplicate(packet.id, this.seenMessageIds)) {
           return;
         }
@@ -453,6 +494,12 @@ class MeshService extends EventEmitter {
           transport: event.transport,
         });
         this._logPeerEvent('MESSAGE_RECEIVED', { peerId, packetId: packet.id, hopCount: event.hop_count });
+      } else {
+        const hasValidContent = packet.text || (packet.content && typeof packet.content === 'string') || (packet.content && typeof packet.content === 'object');
+        if (!hasValidContent) {
+          console.log(`[MESH] [FILTERED] Dropping packet with missing text/content: type=${packet.type}`);
+          return;
+        }
       }
 
       this.emit('message_received', {
@@ -468,14 +515,6 @@ class MeshService extends EventEmitter {
 
       if (packet && packet.type === PACKET_TYPE.MESSAGE && packet.recipient) {
         await this._sendAck(packet.id, packet.sender);
-      }
-
-      if (packet && packet.type === PACKET_TYPE.HEARTBEAT) {
-        const senderId = packet.sender;
-        if (senderId) {
-          this._handleHeartbeatResponse(senderId);
-          await this._sendHeartbeatResponse(senderId);
-        }
       }
     });
 
@@ -534,6 +573,9 @@ class MeshService extends EventEmitter {
         if (event.message.includes('reassembly')) {
           console.log('[MESH][FRAGMENT] REASSEMBLY_COMPLETE', ctx);
         }
+        if (context.peerId && this.peers.has(context.peerId)) {
+          peerRegistry.updateLastSeen(context.peerId);
+        }
       }
       
       if (event.level === 'error') console.error(tag, event.message, ctx);
@@ -562,8 +604,13 @@ class MeshService extends EventEmitter {
         state.deviceIdResolved = true;
         state.linkReady = true;
         state.missedHeartbeats = 0;
+        this.exhaustionRecoveryCount.delete(peerId);
         this.heartbeatResponseTimestamps.set(peerId, Date.now());
         console.log('[MESH] Session established for peer:', peerId.slice(0, 8));
+        if (this.messageQueue.length > 0) {
+          console.log('[MESH] Flushing', this.messageQueue.length, 'queued messages after session recovery');
+          this.flushQueue();
+        }
       }
       logProto('neighbor/session: secure_session_established', event);
     });
@@ -608,6 +655,17 @@ class MeshService extends EventEmitter {
     });
   }
 
+  async _ensureGattConnectionDelay() {
+    const now = Date.now();
+    const timeSinceLastConnect = now - this.lastConnectTimestamp;
+    if (timeSinceLastConnect < MIN_GATT_INTERVAL_MS) {
+      const delay = MIN_GATT_INTERVAL_MS - timeSinceLastConnect;
+      console.log(`[MESH] Rate limiting connectGatt, waiting ${delay}ms`);
+      await new Promise(resolve => setTimeout(resolve, delay));
+    }
+    this.lastConnectTimestamp = Date.now();
+  }
+
   async _establishSessionForPeer(peerId) {
     if (!this.protocol) {
       this._logPeerEvent('SESSION_SKIPPED', { peerId, reason: 'protocol_not_ready' });
@@ -621,8 +679,10 @@ class MeshService extends EventEmitter {
 
     this._logPeerEvent('SESSION_STARTING', { peerId });
     
+    await this._ensureGattConnectionDelay();
+    
     const MAX_RETRIES = 3;
-    const RETRY_DELAY_MS = 3000;
+    const MAX_EXHAUSTION_CYCLES = 2;
     
     for (let attempt = 1; attempt <= MAX_RETRIES; attempt++) {
       if (!this.peers.has(peerId)) {
@@ -645,11 +705,52 @@ class MeshService extends EventEmitter {
       }
       
       if (attempt < MAX_RETRIES && this.peers.has(peerId)) {
-        await new Promise(resolve => setTimeout(resolve, RETRY_DELAY_MS));
+        await new Promise(resolve => setTimeout(resolve, 3000));
       }
     }
     
     this._logPeerEvent('SESSION_EXHAUSTED', { peerId, maxRetries: MAX_RETRIES });
+    
+    const exhaustionCycle = (this.exhaustionRecoveryCount.get(peerId) || 0) + 1;
+    this.exhaustionRecoveryCount.set(peerId, exhaustionCycle);
+    
+    if (exhaustionCycle > MAX_EXHAUSTION_CYCLES) {
+      this._logPeerEvent('SESSION_GIVING_UP', { peerId, exhaustionCycle });
+      return;
+    }
+    
+    console.log(`[MESH] Session exhausted for ${peerId}, scheduling recovery attempt in 10s`);
+    
+    if (this.sessionRecoveryTimers.has(peerId)) {
+      clearTimeout(this.sessionRecoveryTimers.get(peerId));
+    }
+    
+    const recoveryTimer = setTimeout(async () => {
+      this.sessionRecoveryTimers.delete(peerId);
+      const currentState = this._getPeerState(peerId);
+      if (!this.peers.has(peerId)) {
+        this.exhaustionRecoveryCount.delete(peerId);
+        return;
+      }
+      const peerInRegistry = peerRegistry.getPeer(peerId);
+      const isLinkReady = currentState.linkReady;
+      const isRegistryRecent = peerInRegistry && Date.now() - peerInRegistry.lastSeen < 60000;
+      
+      if (isLinkReady || isRegistryRecent) {
+        this._logPeerEvent('SESSION_RECOVERY_ATTEMPT', { peerId, exhaustionCycle });
+        currentState.sessionEstablished = false;
+        currentState.peerRegistered = false;
+        currentState.deviceIdResolved = false;
+        await this._establishSessionForPeer(peerId);
+      } else {
+        this._logPeerEvent('SESSION_RECOVERY_SKIPPED', { peerId, reason: 'link_not_ready' });
+        this.exhaustionRecoveryCount.delete(peerId);
+        this.peers.delete(peerId);
+        this.emit('peer_lost', { id: peerId });
+      }
+    }, 10000);
+    
+    this.sessionRecoveryTimers.set(peerId, recoveryTimer);
   }
 
   async stop() {
@@ -662,6 +763,10 @@ class MeshService extends EventEmitter {
     this._stopCacheClearTimer();
     this._stopHeartbeatInterval();
     this.initPromise = null;
+    this.sessionRecoveryTimers.forEach((timer) => clearTimeout(timer));
+    this.sessionRecoveryTimers.clear();
+    this.gattCloseTimers.forEach((timer) => clearTimeout(timer));
+    this.gattCloseTimers.clear();
     try {
       peerRegistry.getPeers().forEach((p) => {
         try {
@@ -689,6 +794,7 @@ class MeshService extends EventEmitter {
     this.peerStates.clear();
     this.heartbeatResponseTimestamps.clear();
     this.sessionEstablishedCount = 0;
+    this.exhaustionRecoveryCount.clear();
     this._releaseWakeLock();
     this._teardownAppStateListener();
     this.isInitialized = false;
