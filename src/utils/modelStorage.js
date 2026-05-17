@@ -36,7 +36,7 @@ const createSha256Hasher = () => {
   };
 };
 
-const HF_TOKEN = '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';
+const HF_TOKEN = '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';
 
 
 export const MODEL_FILENAME =

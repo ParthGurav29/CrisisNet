@@ -1,7 +1,7 @@
 import meshEvents from './MeshEvents';
 import meshLogger from './MeshLogger';
 
-const PEER_TIMEOUT_MS = 15000;
+const PEER_TIMEOUT_MS = 30000;
 const CLEANUP_INTERVAL_MS = 5000;
 const RSSI_SMOOTHING_FACTOR = 3;
 

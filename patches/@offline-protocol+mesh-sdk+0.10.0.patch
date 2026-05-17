@@ -28,9 +28,9 @@ index e44e64a..f914081 100644
 -        private const val MAX_FRAGMENT_SIZE = 185
 +        /**
 +         * Rust fragmenter fallback when per-peer negotiated MTU is not yet flushed.
-+         * Matches default ATT MTU 23 − 3 = 20 until [protocol.bleSetPeerMtu] runs.
++         * Updated to 182 to reduce fragment count (3-4 per message vs 50+).
 +         */
-+        private const val MAX_FRAGMENT_SIZE = 20
++        private const val MAX_FRAGMENT_SIZE = 182
          /**
           * Hard cap on the number of fragments [drainAndSendFragments] will
           * pull from the Rust side in one main-thread tick. Above this we
@@ -43,9 +43,9 @@ index e44e64a..f914081 100644
 -        /** Absolute minimum RSSI below which we refuse to connect - matches iOS */
 -        private const val MINIMUM_RSSI_TO_CONNECT = -90
 +        /** Minimum RSSI for mid-density adaptive filtering (relaxed for real-world RF). */
-+        private const val ADAPTIVE_MIN_RSSI = -100
++        private const val ADAPTIVE_MIN_RSSI = -95
 +        /** Absolute minimum RSSI below which we refuse to connect (mesh must work at distance). */
-+        private const val MINIMUM_RSSI_TO_CONNECT = -120
++        private const val MINIMUM_RSSI_TO_CONNECT = -95
          /** Peer count threshold below which we process all advertisements */
          private const val ADAPTIVE_LOW_DENSITY_THRESHOLD = 10
          /** Peer count threshold above which we apply maximum throttling */
@@ -98,7 +98,7 @@ index e44e64a..f914081 100644
      // read has mapped the address to a stable device id — at that point
      // we flush into Rust via `protocol.bleSetPeerMtu` so the fragmenter
 -    // can size outbound chunks per peer instead of using the 185-byte
-+    // can size outbound chunks per peer instead of using the 20-byte
++    // can size outbound chunks per peer instead of using the 182-byte
      // fallback. Entries are removed on successful flush (so a reconnect
      // cannot observe a stale value) and on disconnect alongside the
      // matching `bleClearPeerMtu` call. Main-thread only — every access

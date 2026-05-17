@@ -113,24 +113,8 @@ class MeshService extends EventEmitter {
     return this.peerStates.get(peerId);
   }
 
-  _getConnectionRole(peerId) {
-    const myId = this.userId || '';
-    if (myId < peerId) {
-      return 'initiator';
-    }
-    return 'acceptor';
-  }
-
   _shouldSendMessageToPeer(peerId) {
-    const state = this._getPeerState(peerId);
-    if (!state.sessionEstablished || !state.peerRegistered) {
-      return false;
-    }
-    const myRole = this._getConnectionRole(peerId);
-    if (myRole === 'initiator') {
-      return state.linkReady;
-    }
-    return true;
+    return this.peers.has(peerId) && this._getPeerState(peerId).sessionEstablished === true;
   }
 
   _updatePeerState(peerId, updates) {
@@ -543,16 +527,35 @@ class MeshService extends EventEmitter {
 
     this._logPeerEvent('SESSION_STARTING', { peerId });
     
-    try {
-      const welcome = await this.protocol.establishSecureSession(peerId);
-      if (welcome) {
-        this._logPeerEvent('DEVICE_ID_RESOLVED', { peerId, resolved: true });
-        console.log('[MESH] establishSecureSession created welcome for', peerId.slice(0, 8));
+    const MAX_RETRIES = 3;
+    const RETRY_DELAY_MS = 3000;
+    
+    for (let attempt = 1; attempt <= MAX_RETRIES; attempt++) {
+      if (!this.peers.has(peerId)) {
+        this._logPeerEvent('SESSION_ABORTED', { peerId, reason: 'peer_removed', attempt });
+        return;
       }
-    } catch (e) {
-      this._logPeerEvent('SESSION_FAILED', { peerId, error: e?.message || e });
-      console.warn('[MESH] establishSecureSession failed for', peerId.slice(0, 8), e?.message || e);
+      
+      this._logPeerEvent('SESSION_ATTEMPT', { peerId, attempt, maxRetries: MAX_RETRIES });
+      
+      try {
+        const welcome = await this.protocol.establishSecureSession(peerId);
+        if (welcome) {
+          this._logPeerEvent('DEVICE_ID_RESOLVED', { peerId, resolved: true });
+          console.log('[MESH] establishSecureSession created welcome for', peerId.slice(0, 8));
+          return;
+        }
+      } catch (e) {
+        this._logPeerEvent('SESSION_FAILED', { peerId, error: e?.message || e, attempt });
+        console.warn('[MESH] establishSecureSession failed for', peerId.slice(0, 8), 'attempt', attempt, e?.message || e);
+      }
+      
+      if (attempt < MAX_RETRIES && this.peers.has(peerId)) {
+        await new Promise(resolve => setTimeout(resolve, RETRY_DELAY_MS));
+      }
     }
+    
+    this._logPeerEvent('SESSION_EXHAUSTED', { peerId, maxRetries: MAX_RETRIES });
   }
 
   async stop() {

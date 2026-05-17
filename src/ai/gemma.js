@@ -14,7 +14,7 @@ let previousAppState = AppState.currentState;
 let isUnloading = false;
 const DEFAULT_MAX_TOKENS = 512;
 const MIN_MAX_TOKENS = 128;
-const MAX_MAX_TOKENS = 1024;
+const MAX_MAX_TOKENS = 2048;
 
 export const AIState = {
   IDLE: 'idle',

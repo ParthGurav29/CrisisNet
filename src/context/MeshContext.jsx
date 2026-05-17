@@ -49,6 +49,7 @@ export const MeshProvider = ({ children }) => {
       return [...prev, {
         ...peer,
         peerState,
+        lastSeen: Date.now(),
       }];
     });
   }, []);
@@ -62,6 +63,7 @@ export const MeshProvider = ({ children }) => {
         transport: peer.capabilities?.transport || 'ble',
         rssi: peer.rssi,
         peerState: peer.peerState,
+        lastSeen: Date.now(),
       }];
       
       const updated = [...prev];
@@ -70,6 +72,7 @@ export const MeshProvider = ({ children }) => {
         rssi: peer.rssi,
         peerState: peer.peerState || updated[index].peerState,
         capabilities: { ...updated[index].capabilities, ...peer.capabilities },
+        lastSeen: Date.now(),
       };
       return updated;
     });
@@ -316,6 +319,11 @@ export const MeshProvider = ({ children }) => {
     isMountedRef.current = true;
     initMesh();
 
+    const cleanupInterval = setInterval(() => {
+      const now = Date.now();
+      setNodes((prev) => prev.filter(n => (now - (n.lastSeen || 0)) < 30000));
+    }, 30000);
+
     const handleAppStateChange = async (nextAppState) => {
       appStateRef.current = nextAppState;
       // Lifecycle is now managed by MeshManager. 
@@ -332,6 +340,7 @@ export const MeshProvider = ({ children }) => {
       isMountedRef.current = false;
       appStateListener.remove();
       cleanupListeners();
+      clearInterval(cleanupInterval);
     };
   }, [initMesh, cleanupListeners, restartMesh]);
 
