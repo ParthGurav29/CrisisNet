@@ -33,7 +33,7 @@
 // its relay/DORS layer if a recipient isn't a direct neighbor.
 
 import { EventEmitter } from 'events';
-import { Platform } from 'react-native';
+import { Platform, AppState, NativeModules } from 'react-native';
 import OfflineProtocol, {
   MessagePriority,
 } from '@offline-protocol/mesh-sdk';
@@ -83,6 +83,7 @@ class MeshService extends EventEmitter {
     this.restartDebounceTimer = null;
     this.pendingRestart = false;
     this.peerCleanupTimer = null;
+    this.cacheClearTimer = null;
 
     this.messageQueue = [];
     this.seenMessageIds = new Set();
@@ -94,6 +95,71 @@ class MeshService extends EventEmitter {
     this.protocolListeners = [];
 
     this.peerStates = new Map();
+    this.heartbeatTimer = null;
+    this.heartbeatResponseTimestamps = new Map();
+
+    this.sessionEstablishedCount = 0;
+    this.wakeLockAcquired = false;
+    this.appStateListener = null;
+  }
+
+  _getWakeLockModule() {
+    return NativeModules?.OfflineProtocolModule || NativeModules?.ReactNativeWakeLock;
+  }
+
+  async _acquireWakeLock() {
+    if (this.wakeLockAcquired) return;
+    try {
+      const mod = this._getWakeLockModule();
+      if (mod && typeof mod.acquireWakeLock === 'function') {
+        await mod.acquireWakeLock('PARTIAL_WAKE_LOCK');
+        this.wakeLockAcquired = true;
+        console.log('[MESH] Wake lock acquired (PARTIAL_WAKE_LOCK)');
+      }
+    } catch (e) {
+      console.warn('[MESH] Failed to acquire wake lock:', e?.message);
+    }
+  }
+
+  async _releaseWakeLock() {
+    if (!this.wakeLockAcquired) return;
+    try {
+      const mod = this._getWakeLockModule();
+      if (mod && typeof mod.releaseWakeLock === 'function') {
+        await mod.releaseWakeLock();
+        this.wakeLockAcquired = false;
+        console.log('[MESH] Wake lock released');
+      }
+    } catch (e) {
+      console.warn('[MESH] Failed to release wake lock:', e?.message);
+    }
+  }
+
+  _updateSessionEstablishedCount(delta) {
+    this.sessionEstablishedCount += delta;
+    console.log('[MESH] sessionEstablished count:', this.sessionEstablishedCount);
+    if (this.sessionEstablishedCount > 0 && !this.wakeLockAcquired) {
+      this._acquireWakeLock();
+    } else if (this.sessionEstablishedCount <= 0 && this.wakeLockAcquired) {
+      this._releaseWakeLock();
+    }
+  }
+
+  _setupAppStateListener() {
+    if (this.appStateListener) return;
+    this.appStateListener = AppState.addEventListener('change', (nextAppState) => {
+      if (nextAppState === 'active' && this.isInitialized) {
+        console.log('[MESH] AppState active - restarting discovery');
+        this.init().catch(() => {});
+      }
+    });
+  }
+
+  _teardownAppStateListener() {
+    if (this.appStateListener) {
+      this.appStateListener.remove();
+      this.appStateListener = null;
+    }
   }
 
   _getPeerState(peerId) {
@@ -108,6 +174,7 @@ class MeshService extends EventEmitter {
         lastDecodeFailure: null,
         pendingInboundFragments: 0,
         pendingOutboundFragments: 0,
+        missedHeartbeats: 0,
       });
     }
     return this.peerStates.get(peerId);
@@ -260,7 +327,11 @@ class MeshService extends EventEmitter {
     }
 
     this.isInitialized = true;
+    this._setupAppStateListener();
     this._startPeerCleanup();
+    this._startCacheClearTimer();
+    this._startHeartbeatInterval();
+    await this.clearNonMeshCache();
     await this._updateSystemState();
 
     // The SDK's BLE transport is symmetric: it advertises + scans + serves
@@ -316,8 +387,12 @@ class MeshService extends EventEmitter {
       const peerId = event?.peer_id;
       if (!peerId) return;
       peerRegistry.removePeer(peerId);
+      const state = this.peerStates.get(peerId);
       const existed = this.peers.delete(peerId);
       if (existed) {
+        if (state?.sessionEstablished) {
+          this._updateSessionEstablishedCount(-1);
+        }
         this.peerStates.delete(peerId);
       }
       if (!existed) return;
@@ -347,6 +422,7 @@ class MeshService extends EventEmitter {
       if (packet && peerId) {
         const state = this._getPeerState(peerId);
         state.lastPacketTimestamp = Date.now();
+        state.missedHeartbeats = 0;
         if (!packet.type) {
           state.lastDecodeFailure = 'missing packet type';
         }
@@ -392,6 +468,14 @@ class MeshService extends EventEmitter {
 
       if (packet && packet.type === PACKET_TYPE.MESSAGE && packet.recipient) {
         await this._sendAck(packet.id, packet.sender);
+      }
+
+      if (packet && packet.type === PACKET_TYPE.HEARTBEAT) {
+        const senderId = packet.sender;
+        if (senderId) {
+          this._handleHeartbeatResponse(senderId);
+          await this._sendHeartbeatResponse(senderId);
+        }
       }
     });
 
@@ -470,10 +554,15 @@ class MeshService extends EventEmitter {
       if (peerId) {
         this._logPeerEvent('SESSION_ESTABLISHED', { peerId, event });
         const state = this._getPeerState(peerId);
-        state.sessionEstablished = true;
+        if (!state.sessionEstablished) {
+          state.sessionEstablished = true;
+          this._updateSessionEstablishedCount(1);
+        }
         state.peerRegistered = true;
         state.deviceIdResolved = true;
         state.linkReady = true;
+        state.missedHeartbeats = 0;
+        this.heartbeatResponseTimestamps.set(peerId, Date.now());
         console.log('[MESH] Session established for peer:', peerId.slice(0, 8));
       }
       logProto('neighbor/session: secure_session_established', event);
@@ -482,6 +571,11 @@ class MeshService extends EventEmitter {
       const peerId = event?.peer_id || event?.recipient_id;
       if (peerId) {
         this._logPeerEvent('SESSION_FAILED', { peerId, reason: event?.reason, error: event?.error });
+        const state = this._getPeerState(peerId);
+        if (state.sessionEstablished) {
+          state.sessionEstablished = false;
+          this._updateSessionEstablishedCount(-1);
+        }
         console.warn('[MESH] Session failed for peer:', peerId.slice(0, 8), event?.reason || event?.error);
       }
       logProto('neighbor/session: secure_session_failed', event);
@@ -565,6 +659,8 @@ class MeshService extends EventEmitter {
       this.pendingRestart = false;
     }
     this._stopPeerCleanup();
+    this._stopCacheClearTimer();
+    this._stopHeartbeatInterval();
     this.initPromise = null;
     try {
       peerRegistry.getPeers().forEach((p) => {
@@ -590,6 +686,11 @@ class MeshService extends EventEmitter {
     }
     this.peers.clear();
     this.peerCount = 0;
+    this.peerStates.clear();
+    this.heartbeatResponseTimestamps.clear();
+    this.sessionEstablishedCount = 0;
+    this._releaseWakeLock();
+    this._teardownAppStateListener();
     this.isInitialized = false;
     this.emit('stopped');
   }
@@ -782,6 +883,125 @@ class MeshService extends EventEmitter {
     }
   }
 
+  _startHeartbeatInterval() {
+    this.heartbeatTimer = setInterval(() => {
+      this._sendHeartbeats();
+    }, 15000);
+  }
+
+  _stopHeartbeatInterval() {
+    if (this.heartbeatTimer) {
+      clearInterval(this.heartbeatTimer);
+      this.heartbeatTimer = null;
+    }
+  }
+
+  async _sendHeartbeats() {
+    for (const [peerId, peer] of this.peers.entries()) {
+      const state = this._getPeerState(peerId);
+      if (state.sessionEstablished) {
+        try {
+          const heartbeatPacket = {
+            id: Date.now().toString(36) + Math.random().toString(36).substring(2, 10),
+            type: PACKET_TYPE.HEARTBEAT,
+            sender: this.userId,
+            recipient: peerId,
+            timestamp: Date.now(),
+          };
+          await this.protocol.sendMessage({
+            recipient: peerId,
+            content: JSON.stringify(heartbeatPacket),
+            priority: MessagePriority.Low,
+          });
+          this._logPeerEvent('HEARTBEAT_SENT', { peerId });
+        } catch (e) {
+          this._logPeerEvent('HEARTBEAT_FAILED', { peerId, error: e?.message });
+        }
+      }
+    }
+    this._checkHeartbeatTimeouts();
+  }
+
+  _checkHeartbeatTimeouts() {
+    const now = Date.now();
+    for (const [peerId, peer] of this.peers.entries()) {
+      const state = this._getPeerState(peerId);
+      if (state.sessionEstablished) {
+        const lastHeartbeatResponse = this.heartbeatResponseTimestamps.get(peerId) || 0;
+        const timeSinceLastResponse = now - lastHeartbeatResponse;
+        if (timeSinceLastResponse > 45000) {
+          state.missedHeartbeats++;
+          this._logPeerEvent('HEARTBEAT_TIMEOUT', { peerId, missedHeartbeats: state.missedHeartbeats });
+          if (state.missedHeartbeats >= 3) {
+            this._logPeerEvent('PEER_LOST_VIA_HEARTBEAT', { peerId, missedHeartbeats: state.missedHeartbeats });
+            state.sessionEstablished = false;
+            this._establishSessionForPeer(peerId);
+          }
+        }
+      }
+    }
+  }
+
+  _handleHeartbeatResponse(peerId) {
+    const state = this._getPeerState(peerId);
+    state.missedHeartbeats = 0;
+    this.heartbeatResponseTimestamps.set(peerId, Date.now());
+    this._logPeerEvent('HEARTBEAT_ACK', { peerId });
+  }
+
+  async _sendHeartbeatResponse(recipientId) {
+    if (!this.protocol) return;
+    try {
+      const heartbeatPacket = {
+        id: Date.now().toString(36) + Math.random().toString(36).substring(2, 10),
+        type: PACKET_TYPE.HEARTBEAT,
+        sender: this.userId,
+        recipient: recipientId,
+        timestamp: Date.now(),
+      };
+      await this.protocol.sendMessage({
+        recipient: recipientId,
+        content: JSON.stringify(heartbeatPacket),
+        priority: MessagePriority.Low,
+      });
+    } catch (e) {
+      this._logPeerEvent('HEARTBEAT_RESPONSE_FAILED', { recipientId, error: e?.message });
+    }
+  }
+
+  _stopCacheClearTimer() {
+    if (this.cacheClearTimer) {
+      clearInterval(this.cacheClearTimer);
+      this.cacheClearTimer = null;
+    }
+  }
+
+  _startCacheClearTimer() {
+    this.cacheClearTimer = setInterval(() => {
+      this.clearNonMeshCache();
+    }, 5 * 60 * 1000);
+  }
+
+  async clearNonMeshCache() {
+    if (!this.protocol) return;
+    try {
+      // 1. Clear native BLE negative cache (verifiedNonMeshDevices)
+      const mod = NativeModules?.OfflineProtocolModule;
+      if (mod && typeof mod.clearNonMeshCache === 'function') {
+        await mod.clearNonMeshCache();
+      }
+
+      // 2. Clear protocol TOFU/blocked users
+      const blockedPeers = await this.protocol.getBlockedUsers().catch(() => []);
+      for (const peerId of blockedPeers) {
+        await this.protocol.resetTofuForPeer(peerId).catch(() => {});
+      }
+      console.log('[MESH] Cleared non_mesh_cache for', blockedPeers.length, 'blocked peers + native BLE cache');
+    } catch (e) {
+      console.warn('[MESH] Failed to clear non_mesh_cache:', e?.message || e);
+    }
+  }
+
   getStats() {
     return {
       peerCount: this.peerCount,
@@ -813,6 +1033,7 @@ class MeshService extends EventEmitter {
         lastDecodeFailure: state.lastDecodeFailure,
         pendingInboundFragments: state.pendingInboundFragments,
         pendingOutboundFragments: state.pendingOutboundFragments,
+        missedHeartbeats: state.missedHeartbeats,
       };
     }
     return result;

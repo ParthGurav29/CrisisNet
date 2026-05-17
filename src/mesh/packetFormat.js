@@ -6,6 +6,7 @@ const PACKET_TYPE = {
   NACK: 'nack',
   PING: 'ping',
   PONG: 'pong',
+  HEARTBEAT: 'heartbeat',
 };
 
 const createPacketId = () => {
